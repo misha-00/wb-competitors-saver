@@ -214,10 +214,10 @@ def save_excel_with_images(root: pathlib.Path,
     out = root / "listing_matrix.xlsx"
     with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
         df_sum = pd.DataFrame(summary_rows)
-        if not df_sum.empty:
-            cols = ["order", "nm_id", "brand", "title", "slides", "folder"]
-            df_sum = df_sum[[c for c in cols if c in df_sum.columns]]
-        df_sum.to_excel(writer, sheet_name="Сводка", index=False)
+if not df_sum.empty:
+    cols = ["Конкурент", "Артикул", "Бренд", "Наименование", "Слайды", "Папка"]
+    df_sum = df_sum[[c for c in cols if c in df_sum.columns]]
+df_sum.to_excel(writer, sheet_name="Сводка", index=False)
 
         wb = writer.book
         ws = wb.add_worksheet("Матрица")
@@ -385,28 +385,29 @@ if do_generate:
 
     # Сводка/Excel/Коллаж
     competitors = sorted([p for p in root.iterdir() if p.is_dir()])
-    summary_rows = []
-    for sub in competitors:
-        nm = sub.name.split("_")[-1]
-        imgs = sorted(list(sub.glob("*.jpg")) + list(sub.glob("*.webp")),
-                      key=lambda p: (int(p.stem) if p.stem.isdigit() else 9999))
-        meta = sub / "meta.json"
-        title = brand = None
-        if meta.exists():
-            try:
-                m = json.loads(meta.read_text(encoding="utf-8"))
-                title, brand = m.get("title"), m.get("brand")
-            except Exception:
-                pass
-        summary_rows.append({
-            "Конкурент": sub.name.split("_")[0],
-            "Артикул": nm,
-            "Бренд": brand,
-            "Наименование": title,
-            "Слайды": len(imgs),
-            "folder": sub.name
-        })
+   summary_rows = []
+for sub in competitors:
+    nm = sub.name.split("_")[-1]
+    imgs = sorted(list(sub.glob("*.jpg")) + list(sub.glob("*.webp")),
+                  key=lambda p: (int(p.stem) if p.stem.isdigit() else 9999))
 
+    title = brand = None
+    meta = sub / "meta.json"
+    if meta.exists():
+        try:
+            m = json.loads(meta.read_text(encoding="utf-8"))
+            title, brand = m.get("title"), m.get("brand")
+        except Exception:
+            pass
+
+    summary_rows.append({
+        "Конкурент": sub.name.split("_")[0],
+        "Артикул": nm,
+        "Бренд": brand,
+        "Наименование": title,
+        "Слайды": len(imgs),
+        "Папка": sub.name,
+    })
     max_slides = detect_max_slides(root)
     xlsx_path = save_excel_with_images(root, summary_rows, limit_slides=max_slides,
                                        cell_w_px=CELL_PX[0], cell_h_px=CELL_P[1] if 'CELL_P' in globals() else CELL_PX[1])
