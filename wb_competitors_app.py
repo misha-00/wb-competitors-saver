@@ -48,7 +48,10 @@ CELL_PX = (160, 160)           # размер картинки в Excel (шир�
 # ---------- UI ----------
 st.set_page_config(page_title="WB Competitors Saver (FAST + Progress)", page_icon="⚡", layout="wide")
 
-
+# после st.set_page_config(...)
+if "mode" not in st.session_state:
+    st.session_state["mode"] = "auth"   # стартуем со страницы входа
+    
 # ==========================
 # ХЕЛПЕРЫ ХРАНИЛИЩА КЛЮЧЕЙ
 # ==========================
@@ -188,16 +191,15 @@ def admin_view():
 # ==========================
 # АВТОРИЗАЦИЯ (ГЕЙТ)
 # ==========================
-def auth_gate() -> bool:
-    """Возвращает True — если уже авторизованы (пользователь или владелец)."""
-    if st.session_state.get("authed"):
-        return True
-    if st.session_state.get("is_admin"):
-        return True
+def auth_gate():
+    """Показывает экран входа и переводит в нужный режим."""
+    # если уже в приложении/админке — просто выходим
+    if st.session_state.get("mode") in ("admin", "app"):
+        return
 
     st.title("🔑 Доступ по ключу")
 
-    # Вход по одноразовому токену
+    # --- вход по одноразовому токену ---
     with st.form("auth_token_form"):
         token = st.text_input("Ключ доступа", type="password", placeholder="одноразовый ключ")
         ok = st.form_submit_button("Войти")
@@ -205,6 +207,7 @@ def auth_gate() -> bool:
         success, msg = validate_and_consume_token(token)
         if success:
             st.session_state["authed"] = True
+            st.session_state["mode"] = "app"     # пускаем в приложение
             st.rerun()
         else:
             st.error(msg)
@@ -212,23 +215,17 @@ def auth_gate() -> bool:
     st.divider()
     st.subheader("Я владелец")
 
-    # Вход владельца
+    # --- вход владельца ---
     with st.form("admin_login_form"):
         admin_pwd = st.text_input("Пароль владельца", type="password", placeholder="ADMIN_PASSWORD")
         admin_ok = st.form_submit_button("Открыть админ-панель")
     if admin_ok:
         if admin_pwd == ADMIN_PASSWORD:
             st.session_state["is_admin"] = True
+            st.session_state["mode"] = "admin"   # идём в админку
             st.rerun()
         else:
             st.error("Неверный пароль владельца.")
-
-    if st.session_state.get("is_admin"):
-        admin_view()
-
-    return False
-
-
 # ==========================
 # ДАЛЬШЕ — ТВОЙ РАБОЧИЙ ФУНКЦИОНАЛ
 # ==========================
@@ -695,5 +692,20 @@ def main_app():
 # ==========================
 # Запуск: сначала авторизация, затем приложение
 # ==========================
-if auth_gate():
+# Роутер
+auth_gate()  # показывает экран входа, если мы ещё в режиме "auth"
+
+mode = st.session_state.get("mode", "auth")
+
+if mode == "admin":
+    # Админ-панель + кнопка перехода в приложение
+    admin_view()
+    st.sidebar.button("➡️ Перейти в приложение", on_click=lambda: st.session_state.update(mode="app"))
+elif mode == "app":
+    # Основное приложение + (если владелец) кнопка назад в админку
+    if st.session_state.get("is_admin"):
+        st.sidebar.button("⚙️ Открыть админ-панель", on_click=lambda: st.session_state.update(mode="admin"))
     main_app()
+else:
+    # остаёмся на экране входа
+    pass
