@@ -3,4 +3,3 @@ requests
 pandas
 pillow
 xlsxwriter
-python-slugify
