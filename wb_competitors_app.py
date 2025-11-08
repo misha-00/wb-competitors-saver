@@ -29,9 +29,9 @@ from urllib3.util.retry import Retry
 
 # Пароль владельца для входа в админ-панель (выдача ключей)
 ADMIN_PASSWORD = (
-    st.secrets.get("ADMIN_PASSWORD")
+    st.secrets.get("Misha0410!")
     if hasattr(st, "secrets") else None
-) or os.environ.get("ADMIN_PASSWORD", "Misha0410!")  # замени на секрет в проде!
+) or os.environ.get("Misha0410!", "change-me")  # замени на секрет в проде!
 
 AUTH_STORE_PATH = pathlib.Path("auth_store.json")   # локальное хранилище ключей
 TOKEN_TTL_HOURS_DEFAULT = 24                        # срок действия ключа, часов
