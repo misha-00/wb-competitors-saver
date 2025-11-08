@@ -30,7 +30,7 @@ THUMB = (360, 360)             # превью в коллаже
 CELL_PX = (160, 160)           # размер картинки в Excel
 
 st.set_page_config(page_title="WB Competitors Saver (FAST + Progress)", page_icon="⚡", layout="wide")
-st.title("⚡ WB Competitors Saver — быстро, чисто и с детальным прогрессом")
+st.title("⚡ WB анализ листинга")
 
 st.caption(
     "Вставь ссылки WB (по одной в строке) → нажми **«Сгенерировать пакет»**.\n"
@@ -399,11 +399,11 @@ if do_generate:
             except Exception:
                 pass
         summary_rows.append({
-            "order": sub.name.split("_")[0],
-            "nm_id": nm,
-            "brand": brand,
-            "title": title,
-            "slides": len(imgs),
+            "Конкурент": sub.name.split("_")[0],
+            "Артикул": nm,
+            "Бренд": brand,
+            "Наименование": title,
+            "Слайды": len(imgs),
             "folder": sub.name
         })
 
