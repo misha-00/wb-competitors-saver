@@ -1,0 +1,6 @@
+streamlit==1.38.0
+requests
+pandas
+pillow
+xlsxwriter
+python-slugify
