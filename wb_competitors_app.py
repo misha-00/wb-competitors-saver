@@ -1,7 +1,3 @@
-import os
-print("Текущий пароль ADMIN_PASSWORD:", os.environ.get("ADMIN_PASSWORD"))
-
-
 # wb_competitors_app.py
 # Доступ по одноразовым ключам + админ-панель
 # Ускоренная загрузка, детальный прогресс, уникальные папки, автоочистка
@@ -31,11 +27,16 @@ from urllib3.util.retry import Retry
 # ------- НАСТРОЙКИ -------
 # =========================
 
-# Пароль владельца для входа в админ-панель (выдача ключей)
-ADMIN_PASSWORD = (
-    st.secrets.get("ADMIN_PASSWORD")
-    if hasattr(st, "secrets") else None
-) or os.environ.get("ADMIN_PASSWORD", "Misha0410!")  # ← вот здесь пароль по умолчанию
+# ====== ADMIN PASSWORD (жёсткая установка) ======
+FORCE_ADMIN_PASSWORD = "Misha0410!"   # поменяй здесь и всё
+ADMIN_PASSWORD = FORCE_ADMIN_PASSWORD # игнорируем secrets и env полностью
+
+# (опционально) временная диагностика источника пароля
+USED_SOURCE = "forced"
+import streamlit as st
+st.sidebar.info(f"Источник пароля: {USED_SOURCE}")  # уберёшь позже
+# ================================================
+
 
 AUTH_STORE_PATH = pathlib.Path("auth_store.json")   # локальное хранилище ключей
 TOKEN_TTL_HOURS_DEFAULT = 24                        # срок действия ключа, часов
