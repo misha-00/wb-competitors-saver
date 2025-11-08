@@ -1,3 +1,7 @@
+import os
+print("Текущий пароль ADMIN_PASSWORD:", os.environ.get("ADMIN_PASSWORD"))
+
+
 # wb_competitors_app.py
 # Доступ по одноразовым ключам + админ-панель
 # Ускоренная загрузка, детальный прогресс, уникальные папки, автоочистка
