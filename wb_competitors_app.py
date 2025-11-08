@@ -397,29 +397,30 @@ def auth_gate() -> bool:
         return True
 
     st.title("🔑 Доступ по ключу")
-    with st.form("auth_form"):
-        token = st.text_input("Ключ доступа", type="password", placeholder="одноразовый ключ")
-        col1, col2 = st.columns(2)
-        with col1:
-            ok = st.form_submit_button("Войти")
-        with col2:
-            pass
 
+    # --- форма для одноразового ключа ---
+    with st.form("auth_token_form"):
+        token = st.text_input("Ключ доступа", type="password", placeholder="одноразовый ключ")
+        ok = st.form_submit_button("Войти")
     if ok:
         success, msg = validate_and_consume_token(token)
         if success:
             st.session_state["authed"] = True
-            st.rerun()  # <-- было st.experimental_rerun()
+            st.rerun()
         else:
             st.error(msg)
 
     st.divider()
     st.subheader("Я владелец")
-    admin_pwd = st.text_input("Пароль владельца", type="password", placeholder="ADMIN_PASSWORD")
-    if st.button("Открыть админ-панель"):
+
+    # --- ФОРМА входа владельца (важно: form_submit_button) ---
+    with st.form("admin_login_form"):
+        admin_pwd = st.text_input("Пароль владельца", type="password", placeholder="ADMIN_PASSWORD")
+        admin_ok = st.form_submit_button("Открыть админ-панель")
+    if admin_ok:
         if admin_pwd == ADMIN_PASSWORD:
             st.session_state["is_admin"] = True
-            st.rerun()  # <-- было st.experimental_rerun()
+            st.rerun()
         else:
             st.error("Неверный пароль владельца.")
 
