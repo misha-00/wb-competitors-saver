@@ -413,7 +413,7 @@ def auth_gate() -> bool:
         success, msg = validate_and_consume_token(token)
         if success:
             st.session_state["authed"] = True
-            st.experimental_rerun()
+            st.rerun()  # <-- было st.experimental_rerun()
         else:
             st.error(msg)
 
@@ -423,7 +423,7 @@ def auth_gate() -> bool:
     if st.button("Открыть админ-панель"):
         if admin_pwd == ADMIN_PASSWORD:
             st.session_state["is_admin"] = True
-            st.experimental_rerun()
+            st.rerun()  # <-- было st.experimental_rerun()
         else:
             st.error("Неверный пароль владельца.")
 
