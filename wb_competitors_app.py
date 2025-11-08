@@ -1,10 +1,10 @@
 # wb_competitors_app.py
 # Быстро + детальный прогресс по фото + уникальные папки + автоочистка
+# Заголовки/капшен — как ты попросил. Колонки сводки — на русском.
 
 import re
 import io
 import json
-import time
 import math
 import zipfile
 import shutil
@@ -27,8 +27,9 @@ REQ_TIMEOUT = (5, 12)          # (connect, read)
 RETRY_TOTAL = 2
 DEFAULT_SLIDES = 10            # если WB не вернул pics
 THUMB = (360, 360)             # превью в коллаже
-CELL_PX = (160, 160)           # размер картинки в Excel
+CELL_PX = (160, 160)           # размер картинки в Excel (ширина, высота)
 
+# ---------- UI ----------
 st.set_page_config(page_title="WB Competitors Saver (FAST + Progress)", page_icon="⚡", layout="wide")
 st.title("⚡ WB анализ листинга")
 
@@ -116,7 +117,7 @@ def parse_basics(prod: dict) -> tuple[str | None, str | None, int]:
 def candidate_image_urls(nm_id: int, idx: int) -> list[str]:
     vol = nm_id // 100000
     part = nm_id // 1000
-    exts = (".webp", ".jpg")  # webp быстрее/легче
+    exts = (".webp", ".jpg")  # webp быстрее/легче — пробуем первым
     baskets = [f"https://basket-{i:02d}.wb.ru" for i in range(1, 33)]
     baskets += [f"https://basket-{i:02d}.wbbasket.ru" for i in range(1, 33)]
     urls = []
@@ -147,13 +148,13 @@ def download_product_images_fast(session: requests.Session, nm: int, pics: int, 
     saved = 0
     tasks = list(range(1, pics + 1))
     workers = min(PER_PRODUCT_WORKERS, max(1, math.ceil(pics / 2)))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+    with cf.ThreadPoolExecutor(max_workers=workers) as pool:
         futures = []
         for i in tasks:
             urls = candidate_image_urls(nm, i)
             dest_stub = subdir / f"{i}"
             futures.append(pool.submit(download_one_image, session, urls, dest_stub))
-        for fut in concurrent.futures.as_completed(futures):
+        for fut in cf.as_completed(futures):
             try:
                 if fut.result():
                     saved += 1
@@ -180,9 +181,11 @@ def download_product_images_detailed(session: requests.Session, nm: int, pics: i
 def detect_max_slides(root: pathlib.Path) -> int:
     max_slides = 0
     for sub in root.iterdir():
-        if not sub.is_dir(): continue
+        if not sub.is_dir():
+            continue
         imgs = list(sub.glob("*.jpg")) + list(sub.glob("*.webp"))
-        if not imgs: continue
+        if not imgs:
+            continue
         local_max = 0
         for p in imgs:
             try:
@@ -213,12 +216,14 @@ def save_excel_with_images(root: pathlib.Path,
                            cell_h_px: int = 160) -> pathlib.Path:
     out = root / "listing_matrix.xlsx"
     with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
+        # --- Сводка (колонки на русском) ---
         df_sum = pd.DataFrame(summary_rows)
-if not df_sum.empty:
-    cols = ["Конкурент", "Артикул", "Бренд", "Наименование", "Слайды", "Папка"]
-    df_sum = df_sum[[c for c in cols if c in df_sum.columns]]
-df_sum.to_excel(writer, sheet_name="Сводка", index=False)
+        if not df_sum.empty:
+            cols = ["Конкурент", "Артикул", "Бренд", "Наименование", "Слайды", "Папка"]
+            df_sum = df_sum[[c for c in cols if c in df_sum.columns]]
+        df_sum.to_excel(writer, sheet_name="Сводка", index=False)
 
+        # --- Матрица изображений ---
         wb = writer.book
         ws = wb.add_worksheet("Матрица")
 
@@ -259,16 +264,20 @@ df_sum.to_excel(writer, sheet_name="Сводка", index=False)
 # ---------- Коллаж ----------
 def save_collage(root: pathlib.Path, limit_slides: int = 10) -> pathlib.Path | None:
     competitors = sorted([p for p in root.iterdir() if p.is_dir()])
-    if not competitors: return None
-    grid, max_rows = [], 0
+    if not competitors:
+        return None
+    grid = []
+    max_rows = 0
     for c in competitors:
         imgs = sorted(list(c.glob("*.jpg")) + list(c.glob("*.webp")),
                       key=lambda p: (int(p.stem) if p.stem.isdigit() else 9999))
         imgs = imgs[:limit_slides]
         max_rows = max(max_rows, len(imgs))
         grid.append(imgs)
-    if max_rows == 0: return None
-    cols, rows = len(grid), max_rows
+    if max_rows == 0:
+        return None
+    cols = len(grid)
+    rows = max_rows
     cell_w, cell_h = THUMB
     pad = 10
     W = cols * cell_w + (cols + 1) * pad
@@ -310,6 +319,7 @@ with st.form("form_links"):
     with c2:
         do_download_zip = st.form_submit_button("⬇️ Скачать архив")
 
+# состояние (в памяти)
 for key, default in [
     ("zip_bytes", None),
     ("zip_name", None),
@@ -385,32 +395,31 @@ if do_generate:
 
     # Сводка/Excel/Коллаж
     competitors = sorted([p for p in root.iterdir() if p.is_dir()])
-   summary_rows = []
-for sub in competitors:
-    nm = sub.name.split("_")[-1]
-    imgs = sorted(list(sub.glob("*.jpg")) + list(sub.glob("*.webp")),
-                  key=lambda p: (int(p.stem) if p.stem.isdigit() else 9999))
+    summary_rows = []
+    for sub in competitors:
+        nm = sub.name.split("_")[-1]
+        imgs = sorted(list(sub.glob("*.jpg")) + list(sub.glob("*.webp")),
+                      key=lambda p: (int(p.stem) if p.stem.isdigit() else 9999))
+        title = brand = None
+        meta = sub / "meta.json"
+        if meta.exists():
+            try:
+                m = json.loads(meta.read_text(encoding="utf-8"))
+                title, brand = m.get("title"), m.get("brand")
+            except Exception:
+                pass
+        summary_rows.append({
+            "Конкурент": sub.name.split("_")[0],
+            "Артикул": nm,
+            "Бренд": brand,
+            "Наименование": title,
+            "Слайды": len(imgs),
+            "Папка": sub.name,
+        })
 
-    title = brand = None
-    meta = sub / "meta.json"
-    if meta.exists():
-        try:
-            m = json.loads(meta.read_text(encoding="utf-8"))
-            title, brand = m.get("title"), m.get("brand")
-        except Exception:
-            pass
-
-    summary_rows.append({
-        "Конкурент": sub.name.split("_")[0],
-        "Артикул": nm,
-        "Бренд": brand,
-        "Наименование": title,
-        "Слайды": len(imgs),
-        "Папка": sub.name,
-    })
     max_slides = detect_max_slides(root)
     xlsx_path = save_excel_with_images(root, summary_rows, limit_slides=max_slides,
-                                       cell_w_px=CELL_PX[0], cell_h_px=CELL_P[1] if 'CELL_P' in globals() else CELL_PX[1])
+                                       cell_w_px=CELL_PX[0], cell_h_px=CELL_PX[1])
     collage_path = save_collage(root, min(max_slides, 10))
 
     # Читаем файлы в память
@@ -429,13 +438,13 @@ for sub in competitors:
     zip_bytes = make_zip_bytes(root)
     zip_name = f"{root.name}.zip"
 
-    # Удаляем папку
+    # Удаляем папку на сервере
     try:
         shutil.rmtree(root, ignore_errors=True)
     except Exception:
         pass
 
-    # Сохраняем в сессию
+    # Кладём в сессию
     st.session_state["zip_bytes"] = zip_bytes
     st.session_state["zip_name"] = zip_name
     st.session_state["excel_bytes"] = excel_bytes
