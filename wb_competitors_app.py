@@ -1,13 +1,13 @@
 # wb_competitors_app.py
-# Публичная версия: сохраняет фото конкурентов WB, делает Excel с картинками,
-# коллаж и даёт скачать всё одним ZIP прямо из браузера.
+# Публичная версия: 2 кнопки
+# 1) "Сгенерировать пакет" — скачивает фото, делает Excel с картинками,
+#    коллаж и собирает ZIP.
+# 2) "Скачать архив" — отдаёт готовый ZIP.
 
 import re
 import io
-import os
 import json
 import time
-import shutil
 import zipfile
 import pathlib
 import requests
@@ -20,13 +20,12 @@ from urllib.parse import urlparse, parse_qs
 
 # ---------------- Streamlit page ----------------
 st.set_page_config(page_title="WB Competitors Saver", page_icon="📦", layout="wide")
-st.title("📦 WB Competitors Saver — публичная версия")
+st.title("📦 WB Competitors Saver — общий доступ")
 
 st.caption(
-    "1) Вставь ссылки WB (каждая с новой строки). "
-    "2) Нажми «Скачать фото» — создастся сессия с подпапками по артикулам. "
-    "3) Нажми «Сформировать таблицу» — Excel с фото в ячейках и коллаж. "
-    "4) Скачай ZIP всех файлов кнопкой ниже."
+    "Вставь ссылки WB (по одной в строке) → нажми **«Сгенерировать пакет»**.\n"
+    "Мы скачиваем фото по каждому артикулу, формируем **Excel с картинками** + **коллаж**, "
+    "и сразу готовим **ZIP**. Затем нажимай **«Скачать архив»**."
 )
 
 # ---------------- Константы ----------------
@@ -40,7 +39,10 @@ DEFAULT_SLIDES = 10           # если WB не сообщает pics
 THUMB = (360, 360)            # превью в коллаже
 CELL_PX = (160, 160)          # размер картинки в excel-ячейке (ширина, высота)
 
-# Рабочая директория сессии (в облаке пишем в cwd)
+# ---------------- Вспомогательные ----------------
+def ensure_dir(p: pathlib.Path):
+    p.mkdir(parents=True, exist_ok=True)
+
 def get_session_root(name_hint: str | None = None) -> pathlib.Path:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     root_name = name_hint.strip() if name_hint and name_hint.strip() else f"WB_Save_{ts}"
@@ -48,8 +50,8 @@ def get_session_root(name_hint: str | None = None) -> pathlib.Path:
     root.mkdir(parents=True, exist_ok=True)
     return root
 
-def ensure_dir(p: pathlib.Path):
-    p.mkdir(parents=True, exist_ok=True)
+def parse_input_urls(text: str) -> list[str]:
+    return [u.strip() for u in (text or "").splitlines() if u.strip()]
 
 # ---------------- WB utils ----------------
 def extract_nm_id(url: str) -> str | None:
@@ -105,7 +107,7 @@ def try_download(urls: list[str], dest_path_stub: pathlib.Path) -> pathlib.Path 
                     ext = ".jpg" if u.lower().endswith(".jpg") else ".webp"
                     final = dest_path_stub.with_suffix(ext)
                     with open(final, "wb") as f:
-                        shutil.copyfileobj(r.raw, f)
+                        f.write(r.content)
                     return final
         except Exception:
             pass
@@ -238,7 +240,6 @@ def make_zip_bytes(root: pathlib.Path) -> bytes:
     with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
         for path in root.rglob("*"):
             if path.is_file():
-                # внутри ZIP делаем относительные пути
                 z.write(path, arcname=str(path.relative_to(root)))
     mem.seek(0)
     return mem.read()
@@ -249,27 +250,31 @@ with st.form("form_links"):
     session_name = st.text_input("Имя общей папки (необязательно)", placeholder="Анализ_товаров")
     c1, c2 = st.columns(2)
     with c1:
-        do_download = st.form_submit_button("⬇️ Скачать фото")
+        do_generate = st.form_submit_button("🚀 Сгенерировать пакет (фото + Excel + коллаж + ZIP)")
     with c2:
-        do_table = st.form_submit_button("📊 Сформировать таблицу (Excel + коллаж)")
+        do_download_zip = st.form_submit_button("⬇️ Скачать архив")
 
-# Управляем текущим корнем сессии через session_state
-if "root_path" not in st.session_state and (do_download or do_table):
-    st.session_state["root_path"] = str(get_session_root(session_name))
+# Храним состояние между кликами
+if "root_path" not in st.session_state:
+    st.session_state["root_path"] = ""
+if "zip_bytes" not in st.session_state:
+    st.session_state["zip_bytes"] = None
+if "zip_name" not in st.session_state:
+    st.session_state["zip_name"] = None
+if "last_excel" not in st.session_state:
+    st.session_state["last_excel"] = None
+if "last_collage" not in st.session_state:
+    st.session_state["last_collage"] = None
 
-root = pathlib.Path(st.session_state.get("root_path", "")) if (do_download or do_table) else None
-
-def parse_input_urls(text: str) -> list[str]:
-    return [u.strip() for u in (text or "").splitlines() if u.strip()]
-
-# --- Кнопка 1: Скачать фото ---
-if do_download:
-    if root is None:
-        st.stop()
+# --- Кнопка 1: Генерация всего ---
+if do_generate:
     links = parse_input_urls(urls_text)
     if not links:
         st.error("Добавь хотя бы одну ссылку.")
         st.stop()
+
+    root = get_session_root(session_name)
+    st.session_state["root_path"] = str(root)
 
     progress = st.progress(0)
     status = st.empty()
@@ -280,15 +285,13 @@ if do_download:
         status.write(f"Обработка {idx}/{total}: {url}")
         nm_raw = extract_nm_id(url)
         if not nm_raw:
-            err_list.append((url, "Не найден артикул (nm_id)"))
-            progress.progress(idx/total); continue
+            err_list.append((url, "Не найден артикул (nm_id)")); progress.progress(idx/total); continue
 
         nm = int(nm_raw)
         try:
             prod = fetch_card_json(nm_raw)
         except Exception as e:
-            err_list.append((url, f"API ошибка: {e}"))
-            progress.progress(idx/total); continue
+            err_list.append((url, f"API ошибка: {e}")); progress.progress(idx/total); continue
 
         title, brand, pics = parse_basics(prod)
         if pics <= 0:
@@ -315,33 +318,8 @@ if do_download:
         progress.progress(idx/total)
         time.sleep(0.03)
 
-    st.success(f"Готово! Папка сессии: {root}")
-    if ok_list:
-        st.subheader("✅ Сохранены")
-        for url, folder, cnt in ok_list:
-            st.write(f"- {folder} — {cnt} фото — {url}")
-    if err_list:
-        st.subheader("⚠️ Ошибки")
-        for url, msg in err_list:
-            st.write(f"- {url}: {msg}")
-
-    # Кнопка скачать ZIP сразу после скачивания
-    zip_bytes = make_zip_bytes(root)
-    st.download_button("⬇️ Скачать ZIP сессии", data=zip_bytes,
-                       file_name=f"{root.name}.zip", mime="application/zip")
-
-# --- Кнопка 2: Сформировать таблицу ---
-if do_table:
-    if root is None or not root.exists():
-        st.error("Папка сессии не найдена. Сначала нажми «Скачать фото».")
-        st.stop()
-
-    competitors = sorted([p for p in root.iterdir() if p.is_dir()])
-    if not competitors:
-        st.error("Нет скачанных папок конкурентов.")
-        st.stop()
-
     # Сводка
+    competitors = sorted([p for p in root.iterdir() if p.is_dir()])
     summary_rows = []
     for sub in competitors:
         nm = sub.name.split("_")[-1]
@@ -364,21 +342,52 @@ if do_table:
             "folder": sub.name
         })
 
-    # Реальное число слайдов для таблицы
     max_slides = detect_max_slides(root)
-
     xlsx_path = save_excel_with_images(root, summary_rows, limit_slides=max_slides,
                                        cell_w_px=CELL_PX[0], cell_h_px=CELL_PX[1])
     collage_path = save_collage(root, min(max_slides, DEFAULT_SLIDES))
 
-    st.success("Готово! Таблица и коллаж созданы.")
+    # Готовим ZIP
+    zip_bytes = make_zip_bytes(root)
+    st.session_state["zip_bytes"] = zip_bytes
+    st.session_state["zip_name"] = f"{root.name}.zip"
+    st.session_state["last_excel"] = xlsx_path
+    st.session_state["last_collage"] = collage_path
+
+    st.success("Готово! Пакет сформирован.")
     st.write(f"📁 Папка сессии: {root}")
     st.write(f"📊 Excel: {xlsx_path.name}")
     if collage_path:
         st.write(f"🖼 Коллаж: {collage_path.name}")
-        st.image(str(collage_path), caption="Matrix Preview", use_container_width=True)
 
-    # Кнопка скачать ZIP полностью
-    zip_bytes = make_zip_bytes(root)
-    st.download_button("⬇️ Скачать ZIP сессии", data=zip_bytes,
-                       file_name=f"{root.name}.zip", mime="application/zip")
+    # Кнопки прямых скачиваний отдельных файлов
+    with open(xlsx_path, "rb") as f:
+        st.download_button("⬇️ Скачать только Excel", data=f.read(),
+                           file_name=xlsx_path.name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    if collage_path and collage_path.exists():
+        with open(collage_path, "rb") as f:
+            st.download_button("⬇️ Скачать только коллаж (JPG)", data=f.read(),
+                               file_name=collage_path.name, mime="image/jpeg")
+
+    # Кнопка ZIP
+    st.download_button("⬇️ Скачать архив (всё вместе)", data=zip_bytes,
+                       file_name=st.session_state["zip_name"], mime="application/zip")
+
+    if ok_list:
+        st.subheader("✅ Сохранены")
+        for url, folder, cnt in ok_list:
+            st.write(f"- {folder} — {cnt} фото — {url}")
+    if err_list:
+        st.subheader("⚠️ Ошибки")
+        for url, msg in err_list:
+            st.write(f"- {url}: {msg}")
+
+# --- Кнопка 2: Скачать ZIP ещё раз (без пересборки) ---
+if do_download_zip:
+    if not st.session_state["zip_bytes"]:
+        st.error("Архив ещё не готов. Сначала нажми «Сгенерировать пакет».")
+    else:
+        st.download_button("⬇️ Скачать архив (всё вместе)",
+                           data=st.session_state["zip_bytes"],
+                           file_name=st.session_state["zip_name"],
+                           mime="application/zip")
