@@ -26,13 +26,9 @@ from urllib3.util.retry import Retry
 # ------------------ Page config (должен быть первым Streamlit-вызовом) ------------------
 st.set_page_config(page_title="WB Competitors Saver (FAST + Progress)", page_icon="⚡", layout="wide")
 
-# ------------------ ВРЕМЕННЫЙ FORCE пароль (для отладки) ------------------
-# Заменить это на secrets/env в продакшне!
-FORCE_ADMIN_PASSWORD = "Misha0410!"    # <- поменяй на свой пароль, или верни секреc/env
-ADMIN_PASSWORD = FORCE_ADMIN_PASSWORD
-
-# небольшой diagnostics (можно убрать)
-st.sidebar.info("Источник пароля: forced")
+# ------------------ ВРЕМЕННЫЙ FORCE пароль владельца ------------------
+# (в продакшне можно заменить на st.secrets или переменную окружения)
+ADMIN_PASSWORD = "Misha0410!"  # <- твой пароль владельца
 
 # ------------------ Конфигурация приложения ------------------
 AUTH_STORE_PATH = pathlib.Path("auth_store.json")   # локальное хранилище ключей
