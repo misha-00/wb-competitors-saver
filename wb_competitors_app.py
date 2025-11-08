@@ -1,8 +1,5 @@
 # wb_competitors_app.py
-# Быстрая публичная версия:
-# 1) "Сгенерировать пакет" — параллельно качает фото (ThreadPool),
-#    делает Excel с картинками, коллаж и сразу готовит ZIP.
-# 2) "Скачать архив" — отдаёт готовый ZIP.
+# Быстро + детальный прогресс по фото + уникальные папки + автоочистка
 
 import re
 import io
@@ -10,6 +7,7 @@ import json
 import time
 import math
 import zipfile
+import shutil
 import pathlib
 import concurrent.futures as cf
 import requests
@@ -22,53 +20,59 @@ from urllib.parse import urlparse, parse_qs
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ---------------- Настройки производительности ----------------
-MAX_WORKERS = 24               # общее число параллельных загрузок (без фанатизма)
-PER_PRODUCT_WORKERS = 8        # ограничение внутри одного товара
-REQ_TIMEOUT = (5, 12)          # (connect, read) таймауты по умолчанию
-RETRY_TOTAL = 2                # число авто-повторов на 5xx/429
-DEFAULT_SLIDES = 10            # если WB не сообщает pics
-THUMB = (360, 360)             # превью для коллажа
-CELL_PX = (160, 160)           # размер картинки в Excel-ячейке
+# ---------- Параметры ----------
+MAX_WORKERS = 24               # общий параллелизм по товарам (быстрый режим)
+PER_PRODUCT_WORKERS = 8        # параллелизм по слайдам внутри товара (быстрый режим)
+REQ_TIMEOUT = (5, 12)          # (connect, read)
+RETRY_TOTAL = 2
+DEFAULT_SLIDES = 10            # если WB не вернул pics
+THUMB = (360, 360)             # превью в коллаже
+CELL_PX = (160, 160)           # размер картинки в Excel
 
-# ---------------- UI ----------------
-st.set_page_config(page_title="WB Competitors Saver (FAST)", page_icon="⚡", layout="wide")
-st.title("⚡ WB Competitors Saver — ускоренная версия")
+st.set_page_config(page_title="WB Competitors Saver (FAST + Progress)", page_icon="⚡", layout="wide")
+st.title("⚡ WB Competitors Saver — быстро, чисто и с детальным прогрессом")
 
 st.caption(
     "Вставь ссылки WB (по одной в строке) → нажми **«Сгенерировать пакет»**.\n"
-    "Сервис параллельно скачает фото по артикулам, соберёт **Excel с картинками**, **коллаж** и **ZIP**."
+    "Опция **«Детальный прогресс (по фото)»** покажет отдельный прогресс-бар для каждого товара и каждого слайда.\n"
+    "После сборки всё упакуем в ZIP и **удалим временную папку** на сервере."
 )
 
+# ---------- Утилиты ----------
 def ensure_dir(p: pathlib.Path):
     p.mkdir(parents=True, exist_ok=True)
 
-def get_session_root(name_hint: str | None = None) -> pathlib.Path:
+def sanitize_name(name: str) -> str:
+    s = (name or "").strip()
+    if not s:
+        return "WB_Save"
+    s = re.sub(r"[^\w\- ]+", "", s, flags=re.U)
+    s = re.sub(r"\s+", "_", s)
+    return s or "WB_Save"
+
+def new_unique_root(name_hint: str | None = None) -> pathlib.Path:
+    base = sanitize_name(name_hint or "WB_Save")
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    root_name = name_hint.strip() if name_hint and name_hint.strip() else f"WB_Save_{ts}"
-    root = pathlib.Path.cwd() / root_name
+    root = pathlib.Path.cwd() / f"{base}_{ts}"
     root.mkdir(parents=True, exist_ok=True)
     return root
 
 def parse_input_urls(text: str) -> list[str]:
     return [u.strip() for u in (text or "").splitlines() if u.strip()]
 
-# ---------------- HTTP Session с keep-alive и retry ----------------
+# ---------- HTTP Session ----------
 def make_http_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept": "*/*",
-        "Accept-Encoding": "identity",    # без gzip — меньше CPU, быстрее I/O на маленьких файлах
+        "Accept-Encoding": "identity",
         "Connection": "keep-alive",
     })
     retry = Retry(
-        total=RETRY_TOTAL,
-        connect=RETRY_TOTAL,
-        read=RETRY_TOTAL,
-        backoff_factor=0.4,
-        status_forcelist=(429, 500, 502, 503, 504),
+        total=RETRY_TOTAL, connect=RETRY_TOTAL, read=RETRY_TOTAL,
+        backoff_factor=0.4, status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=frozenset(["GET", "HEAD"])
     )
     adapter = HTTPAdapter(max_retries=retry, pool_connections=64, pool_maxsize=64)
@@ -76,7 +80,7 @@ def make_http_session() -> requests.Session:
     s.mount("https://", adapter)
     return s
 
-# ---------------- WB utils ----------------
+# ---------- WB ----------
 def extract_nm_id(url: str) -> str | None:
     try:
         u = urlparse(url)
@@ -113,8 +117,7 @@ def parse_basics(prod: dict) -> tuple[str | None, str | None, int]:
 def candidate_image_urls(nm_id: int, idx: int) -> list[str]:
     vol = nm_id // 100000
     part = nm_id // 1000
-    # webp обычно быстрее и меньше — пробуем первым
-    exts = (".webp", ".jpg")
+    exts = (".webp", ".jpg")  # webp быстрее/легче
     baskets = [f"https://basket-{i:02d}.wb.ru" for i in range(1, 33)]
     baskets += [f"https://basket-{i:02d}.wbbasket.ru" for i in range(1, 33)]
     urls = []
@@ -124,9 +127,8 @@ def candidate_image_urls(nm_id: int, idx: int) -> list[str]:
             urls.append(base + ext)
     return urls
 
-# ---------------- Параллельные загрузки ----------------
+# ---------- Загрузка ----------
 def download_one_image(session: requests.Session, urls: list[str], dest_path: pathlib.Path) -> bool:
-    """Пробуем варианты URL до первого успеха. Если файл уже есть — пропускаем."""
     if dest_path.with_suffix(".webp").exists() or dest_path.with_suffix(".jpg").exists():
         return True
     for u in urls:
@@ -141,20 +143,18 @@ def download_one_image(session: requests.Session, urls: list[str], dest_path: pa
             pass
     return False
 
-def download_product_images(session: requests.Session, nm: int, pics: int, subdir: pathlib.Path) -> int:
+def download_product_images_fast(session: requests.Session, nm: int, pics: int, subdir: pathlib.Path) -> int:
     ensure_dir(subdir)
     saved = 0
-    # задачи по слайдам (1..pics)
     tasks = list(range(1, pics + 1))
-    # ограничим конкуренцию внутри товара
     workers = min(PER_PRODUCT_WORKERS, max(1, math.ceil(pics / 2)))
-    with cf.ThreadPoolExecutor(max_workers=workers) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         futures = []
         for i in tasks:
             urls = candidate_image_urls(nm, i)
             dest_stub = subdir / f"{i}"
             futures.append(pool.submit(download_one_image, session, urls, dest_stub))
-        for fut in cf.as_completed(futures):
+        for fut in concurrent.futures.as_completed(futures):
             try:
                 if fut.result():
                     saved += 1
@@ -162,15 +162,28 @@ def download_product_images(session: requests.Session, nm: int, pics: int, subdi
                 pass
     return saved
 
-# ---------------- Подсчёт слайдов ----------------
+def download_product_images_detailed(session: requests.Session, nm: int, pics: int,
+                                     subdir: pathlib.Path,
+                                     progress_bar, status_text) -> int:
+    """Последовательно — чтобы безопасно обновлять UI по каждому слайду."""
+    ensure_dir(subdir)
+    saved = 0
+    progress_bar.progress(0.0)
+    for i in range(1, pics + 1):
+        urls = candidate_image_urls(nm, i)
+        ok = download_one_image(session, urls, subdir / f"{i}")
+        saved += 1 if ok else 0
+        status_text.write(f"Слайд {i}/{pics} — {'OK' if ok else 'пропуск'}")
+        progress_bar.progress(i / pics)
+    return saved
+
+# ---------- Подсчёт слайдов ----------
 def detect_max_slides(root: pathlib.Path) -> int:
     max_slides = 0
     for sub in root.iterdir():
-        if not sub.is_dir():
-            continue
+        if not sub.is_dir(): continue
         imgs = list(sub.glob("*.jpg")) + list(sub.glob("*.webp"))
-        if not imgs:
-            continue
+        if not imgs: continue
         local_max = 0
         for p in imgs:
             try:
@@ -182,7 +195,7 @@ def detect_max_slides(root: pathlib.Path) -> int:
         max_slides = max(max_slides, local_max)
     return max_slides or 1
 
-# ---------------- Excel + изображения ----------------
+# ---------- Excel + изображения ----------
 def _image_to_png_bytes(path: pathlib.Path, max_w: int, max_h: int) -> BytesIO | None:
     try:
         im = Image.open(path).convert("RGB")
@@ -244,23 +257,19 @@ def save_excel_with_images(root: pathlib.Path,
                                         {"image_data": bio, "x_offset": x_offset, "y_offset": y_offset})
     return out
 
-# ---------------- Коллаж ----------------
+# ---------- Коллаж ----------
 def save_collage(root: pathlib.Path, limit_slides: int = 10) -> pathlib.Path | None:
     competitors = sorted([p for p in root.iterdir() if p.is_dir()])
-    if not competitors:
-        return None
-    grid = []
-    max_rows = 0
+    if not competitors: return None
+    grid, max_rows = [], 0
     for c in competitors:
         imgs = sorted(list(c.glob("*.jpg")) + list(c.glob("*.webp")),
                       key=lambda p: (int(p.stem) if p.stem.isdigit() else 9999))
         imgs = imgs[:limit_slides]
         max_rows = max(max_rows, len(imgs))
         grid.append(imgs)
-    if max_rows == 0:
-        return None
-    cols = len(grid)
-    rows = max_rows
+    if max_rows == 0: return None
+    cols, rows = len(grid), max_rows
     cell_w, cell_h = THUMB
     pad = 10
     W = cols * cell_w + (cols + 1) * pad
@@ -281,7 +290,7 @@ def save_collage(root: pathlib.Path, limit_slides: int = 10) -> pathlib.Path | N
     canvas.save(out, format="JPEG", quality=85)
     return out
 
-# ---------------- ZIP ----------------
+# ---------- ZIP ----------
 def make_zip_bytes(root: pathlib.Path) -> bytes:
     mem = io.BytesIO()
     with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
@@ -291,88 +300,91 @@ def make_zip_bytes(root: pathlib.Path) -> bytes:
     mem.seek(0)
     return mem.read()
 
-# ---------------- Интерфейс ----------------
+# ---------- Интерфейс ----------
 with st.form("form_links"):
     urls_text = st.text_area("Ссылки на товары WB (по одной на строке)", height=160)
-    session_name = st.text_input("Имя общей папки (необязательно)", placeholder="Анализ_товаров")
+    session_name = st.text_input("Имя набора (необязательно)", placeholder="Анализ_товаров")
+    detailed = st.checkbox("Детальный прогресс (по фото)", value=True)
     c1, c2 = st.columns(2)
     with c1:
-        do_generate = st.form_submit_button("🚀 Сгенерировать пакет (быстро)")
+        do_generate = st.form_submit_button("🚀 Сгенерировать пакет")
     with c2:
         do_download_zip = st.form_submit_button("⬇️ Скачать архив")
 
-# состояние
-if "root_path" not in st.session_state:
-    st.session_state["root_path"] = ""
-if "zip_bytes" not in st.session_state:
-    st.session_state["zip_bytes"] = None
-if "zip_name" not in st.session_state:
-    st.session_state["zip_name"] = None
-if "last_excel" not in st.session_state:
-    st.session_state["last_excel"] = None
-if "last_collage" not in st.session_state:
-    st.session_state["last_collage"] = None
+for key, default in [
+    ("zip_bytes", None),
+    ("zip_name", None),
+    ("excel_bytes", None),
+    ("excel_name", None),
+    ("collage_bytes", None),
+    ("collage_name", None),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
-# --- Генерация всего ---
+# ---------- Генерация ----------
 if do_generate:
     links = parse_input_urls(urls_text)
     if not links:
         st.error("Добавь хотя бы одну ссылку."); st.stop()
 
-    root = get_session_root(session_name)
-    st.session_state["root_path"] = str(root)
-
-    status = st.empty()
-    progress = st.progress(0)
-
+    root = new_unique_root(session_name)
     session = make_http_session()
+
+    overall = st.progress(0.0)
+    overall_text = st.empty()
 
     ok_list, err_list = [], []
     total = len(links)
 
-    # Пул на все товары (но картинки внутри товара качаются своим мини-пулом)
-    with cf.ThreadPoolExecutor(max_workers=min(MAX_WORKERS, total or 1)) as outer_pool:
-        futures = []
-        for idx, url in enumerate(links, start=1):
-            futures.append((idx, url, outer_pool.submit(
-                lambda _idx=idx, _url=url: ( _idx, _url, None, None, 0, None )
-            )))  # заглушка, реальная работа ниже (последовательно, чтобы статус красиво шёл)
+    for idx, url in enumerate(links, start=1):
+        overall_text.write(f"Товар {idx}/{total}: {url}")
 
-        # Последовательно обрабатываем товары, но внутри — параллельные картинки
-        for idx, url in [(i, u) for i, u, _ in futures]:
-            status.write(f"Товар {idx}/{total}: {url}")
-            nm_raw = extract_nm_id(url)
-            if not nm_raw:
-                err_list.append((url, "Не найден артикул (nm_id)"))
-                progress.progress(idx/total); continue
+        nm_raw = extract_nm_id(url)
+        if not nm_raw:
+            err_list.append((url, "Не найден артикул (nm_id)"))
+            overall.progress(idx/total); continue
 
-            nm = int(nm_raw)
-            try:
-                prod = fetch_card_json(session, nm_raw)
-            except Exception as e:
-                err_list.append((url, f"API ошибка: {e}"))
-                progress.progress(idx/total); continue
+        nm = int(nm_raw)
+        try:
+            prod = fetch_card_json(session, nm_raw)
+        except Exception as e:
+            err_list.append((url, f"API ошибка: {e}"))
+            overall.progress(idx/total); continue
 
-            title, brand, pics = parse_basics(prod)
-            if pics <= 0:
-                pics = DEFAULT_SLIDES
+        title, brand, pics = parse_basics(prod)
+        if pics <= 0:
+            pics = DEFAULT_SLIDES
 
-            subdir = root / f"{idx:03d}_{nm}"
-            ensure_dir(subdir)
+        subdir = root / f"{idx:03d}_{nm}"
+        ensure_dir(subdir)
+        (subdir / "meta.json").write_text(
+            json.dumps({"url": url, "nm_id": nm, "title": title, "brand": brand,
+                        "saved_at": datetime.now().isoformat()}, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
 
-            meta = {"url": url, "nm_id": nm, "title": title, "brand": brand, "saved_at": datetime.now().isoformat()}
-            (subdir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-
-            saved = download_product_images(session, nm, pics, subdir)
-
-            if saved > 0:
-                ok_list.append((url, subdir.name, saved))
+        # Детальный блок по товару
+        exp = st.expander(f"📦 {idx}/{total} • nm={nm} • {title or 'Без названия'}", expanded=True if detailed else False)
+        with exp:
+            pbar = st.progress(0.0)
+            line = st.empty()
+            if detailed:
+                saved = download_product_images_detailed(session, nm, pics, subdir, pbar, line)
             else:
-                err_list.append((url, "Не удалось сохранить изображения"))
+                line.write("Скачиваю изображения (ускоренный режим)…")
+                saved = download_product_images_fast(session, nm, pics, subdir)
+                pbar.progress(1.0)
+                line.write(f"Готово: сохранено {saved} из ~{pics}")
 
-            progress.progress(idx/total)
+        if saved > 0:
+            ok_list.append((url, subdir.name, saved))
+        else:
+            err_list.append((url, "Не удалось сохранить изображения"))
 
-    # Сводка/таблица/коллаж
+        overall.progress(idx/total)
+
+    # Сводка/Excel/Коллаж
     competitors = sorted([p for p in root.iterdir() if p.is_dir()])
     summary_rows = []
     for sub in competitors:
@@ -398,32 +410,59 @@ if do_generate:
 
     max_slides = detect_max_slides(root)
     xlsx_path = save_excel_with_images(root, summary_rows, limit_slides=max_slides,
-                                       cell_w_px=CELL_PX[0], cell_h_px=CELL_PX[1])
+                                       cell_w_px=CELL_PX[0], cell_h_px=CELL_P[1] if 'CELL_P' in globals() else CELL_PX[1])
     collage_path = save_collage(root, min(max_slides, 10))
+
+    # Читаем файлы в память
+    with open(xlsx_path, "rb") as f:
+        excel_bytes = f.read()
+    excel_name = xlsx_path.name
+
+    collage_bytes = None
+    collage_name = None
+    if collage_path and collage_path.exists():
+        with open(collage_path, "rb") as f:
+            collage_bytes = f.read()
+        collage_name = collage_path.name
 
     # ZIP
     zip_bytes = make_zip_bytes(root)
+    zip_name = f"{root.name}.zip"
+
+    # Удаляем папку
+    try:
+        shutil.rmtree(root, ignore_errors=True)
+    except Exception:
+        pass
+
+    # Сохраняем в сессию
     st.session_state["zip_bytes"] = zip_bytes
-    st.session_state["zip_name"] = f"{root.name}.zip"
-    st.session_state["last_excel"] = xlsx_path
-    st.session_state["last_collage"] = collage_path
+    st.session_state["zip_name"] = zip_name
+    st.session_state["excel_bytes"] = excel_bytes
+    st.session_state["excel_name"] = excel_name
+    st.session_state["collage_bytes"] = collage_bytes
+    st.session_state["collage_name"] = collage_name
 
-    st.success("Готово! Пакет сформирован.")
-    st.write(f"📁 Папка: {root}")
-    st.write(f"📊 Excel: {xlsx_path.name}")
-    if collage_path:
-        st.write(f"🖼 Коллаж: {collage_path.name}")
+    st.success("Готово! Пакет сформирован. Временная папка удалена.")
+    st.write(f"📊 Excel: {excel_name}")
+    if collage_name:
+        st.write(f"🖼 Коллаж: {collage_name}")
 
-    # Кнопки прямых скачиваний
-    with open(xlsx_path, "rb") as f:
-        st.download_button("⬇️ Скачать только Excel", data=f.read(),
-                           file_name=xlsx_path.name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    if collage_path and collage_path.exists():
-        with open(collage_path, "rb") as f:
-            st.download_button("⬇️ Скачать только коллаж (JPG)", data=f.read(),
-                               file_name=collage_path.name, mime="image/jpeg")
+    # Кнопки скачивания
+    if st.session_state["excel_bytes"]:
+        st.download_button("⬇️ Скачать только Excel",
+                           data=st.session_state["excel_bytes"],
+                           file_name=st.session_state["excel_name"],
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    if st.session_state["collage_bytes"]:
+        st.download_button("⬇️ Скачать только коллаж (JPG)",
+                           data=st.session_state["collage_bytes"],
+                           file_name=st.session_state["collage_name"],
+                           mime="image/jpeg")
     st.download_button("⬇️ Скачать архив (всё вместе)",
-                       data=zip_bytes, file_name=st.session_state["zip_name"], mime="application/zip")
+                       data=st.session_state["zip_bytes"],
+                       file_name=st.session_state["zip_name"],
+                       mime="application/zip")
 
     if ok_list:
         st.subheader("✅ Сохранены")
@@ -434,7 +473,7 @@ if do_generate:
         for url, msg in err_list:
             st.write(f"- {url}: {msg}")
 
-# --- Скачать ZIP без пересборки ---
+# Повторная выгрузка ZIP
 if do_download_zip:
     if not st.session_state["zip_bytes"]:
         st.error("Архив ещё не готов. Сначала нажми «Сгенерировать пакет».")
