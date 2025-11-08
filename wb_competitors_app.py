@@ -1,7 +1,8 @@
 # wb_competitors_app.py
-# Быстро + детальный прогресс по фото + уникальные папки + автоочистка
-# Заголовки/капшен — как ты попросил. Колонки сводки — на русском.
+# Доступ по одноразовым ключам + админ-панель
+# Ускоренная загрузка, детальный прогресс, уникальные папки, автоочистка
 
+import os
 import re
 import io
 import json
@@ -9,36 +10,178 @@ import math
 import zipfile
 import shutil
 import pathlib
+import secrets
+from datetime import datetime, timedelta
 import concurrent.futures as cf
+
 import requests
 import streamlit as st
 import pandas as pd
 from PIL import Image
 from io import BytesIO
-from datetime import datetime
 from urllib.parse import urlparse, parse_qs
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ---------- Параметры ----------
-MAX_WORKERS = 24               # общий параллелизм по товарам (быстрый режим)
-PER_PRODUCT_WORKERS = 8        # параллелизм по слайдам внутри товара (быстрый режим)
-REQ_TIMEOUT = (5, 12)          # (connect, read)
+# =========================
+# ------- НАСТРОЙКИ -------
+# =========================
+
+# Пароль владельца для входа в админ-панель (выдача ключей)
+ADMIN_PASSWORD = (
+    st.secrets.get("ADMIN_PASSWORD")
+    if hasattr(st, "secrets") else None
+) or os.environ.get("ADMIN_PASSWORD", "change-me")  # замени на секрет в проде!
+
+AUTH_STORE_PATH = pathlib.Path("auth_store.json")   # локальное хранилище ключей
+TOKEN_TTL_HOURS_DEFAULT = 24                        # срок действия ключа, часов
+
+# Производительность
+MAX_WORKERS = 24
+PER_PRODUCT_WORKERS = 8
+REQ_TIMEOUT = (5, 12)
 RETRY_TOTAL = 2
-DEFAULT_SLIDES = 10            # если WB не вернул pics
-THUMB = (360, 360)             # превью в коллаже
-CELL_PX = (160, 160)           # размер картинки в Excel (ширина, высота)
+DEFAULT_SLIDES = 10
+THUMB = (360, 360)
+CELL_PX = (160, 160)
 
-# ---------- UI ----------
-st.set_page_config(page_title="WB Competitors Saver (FAST + Progress)", page_icon="⚡", layout="wide")
-st.title("⚡ WB анализ листинга")
+# =========================
+# ------ АВТОРИЗАЦИЯ ------
+# =========================
 
-st.caption(
-    "Вставь ссылки WB (по одной в строке) → нажми **«Сгенерировать пакет»**.\n"
-    "Сервис параллельно скачает фото по артикулам, соберёт **Excel с картинками**, **коллаж** и **ZIP**."
-)
+def _load_store() -> dict:
+    if AUTH_STORE_PATH.exists():
+        try:
+            return json.loads(AUTH_STORE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {"tokens": {}}  # token -> {issued_at, expires_at, used, note}
 
-# ---------- Утилиты ----------
+def _save_store(store: dict):
+    AUTH_STORE_PATH.write_text(json.dumps(store, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def _gen_token(n_chars: int = 16) -> str:
+    # URL-safe, коротко и удобно
+    return secrets.token_urlsafe(n_chars)[:n_chars]
+
+def issue_tokens(n: int, ttl_hours: int, note: str | None = None) -> list[dict]:
+    store = _load_store()
+    out = []
+    now = datetime.utcnow()
+    exp = now + timedelta(hours=ttl_hours)
+    for _ in range(n):
+        token = _gen_token(16)
+        while token in store["tokens"]:
+            token = _gen_token(16)
+        store["tokens"][token] = {
+            "issued_at": now.isoformat(),
+            "expires_at": exp.isoformat(),
+            "used": False,
+            "note": note or ""
+        }
+        out.append({"token": token, "expires_at": exp.isoformat(), "note": note or ""})
+    _save_store(store)
+    return out
+
+def validate_and_consume_token(token: str) -> tuple[bool, str]:
+    """Возвращает (ok, message). При успехе помечает ключ как used."""
+    token = (token or "").strip()
+    if not token:
+        return False, "Ключ пустой."
+    store = _load_store()
+    meta = store["tokens"].get(token)
+    if not meta:
+        return False, "Ключ не найден."
+    if meta.get("used"):
+        return False, "Ключ уже использован."
+    try:
+        exp = datetime.fromisoformat(meta["expires_at"])
+    except Exception:
+        exp = datetime.utcnow() - timedelta(seconds=1)
+    if datetime.utcnow() > exp:
+        return False, "Срок действия ключа истёк."
+    # валидный — поглощаем
+    meta["used"] = True
+    store["tokens"][token] = meta
+    _save_store(store)
+    return True, "Доступ разрешён."
+
+def admin_view():
+    st.subheader("🔐 Админ-панель (выдача ключей)")
+    with st.form("issue_form"):
+        col1, col2 = st.columns([2,1])
+        with col1:
+            note = st.text_input("Заметка (например, кому выдан)", placeholder="Клиент Иванов / тест")
+        with col2:
+            ttl = st.number_input("Срок действия, часов", min_value=1, max_value=168, value=TOKEN_TTL_HOURS_DEFAULT, step=1)
+        count = st.number_input("Сколько ключей выдать", min_value=1, max_value=100, value=5, step=1)
+        btn = st.form_submit_button("Сгенерировать ключи")
+    if btn:
+        tokens = issue_tokens(int(count), int(ttl), note.strip() if note else None)
+        st.success("Ключи сгенерированы. Отправь их пользователям.")
+        for t in tokens:
+            st.code(t["token"])
+        st.caption("Подсказка: каждый ключ работает только один раз.")
+
+    # Просмотр активных/использованных (необязательно)
+    with st.expander("Список ключей"):
+        store = _load_store()
+        rows = []
+        for k, v in store["tokens"].items():
+            rows.append({
+                "token": k,
+                "used": v.get("used"),
+                "expires_at": v.get("expires_at"),
+                "note": v.get("note", "")
+            })
+        if rows:
+            df = pd.DataFrame(rows).sort_values(by=["used","expires_at"])
+            st.dataframe(df, use_container_width=True)
+        else:
+            st.info("Ключей пока нет.")
+
+def auth_gate() -> bool:
+    """Возвращает True если пользователь авторизован; иначе рисует форму входа."""
+    # Сессия
+    if st.session_state.get("authed"):
+        return True
+
+    st.title("🔑 Доступ по ключу")
+    st.write("Введите одноразовый ключ, выданный владельцем приложения.")
+    with st.form("auth_form"):
+        token = st.text_input("Ключ доступа", type="password")
+        col1, col2 = st.columns(2)
+        with col1:
+            ok = st.form_submit_button("Войти")
+        with col2:
+            show_admin = st.form_submit_button("Я владелец")
+    if ok:
+        success, msg = validate_and_consume_token(token)
+        if success:
+            st.session_state["authed"] = True
+            st.experimental_rerun()
+        else:
+            st.error(msg)
+            return False
+
+    if show_admin:
+        # Простейшая проверка пароля владельца
+        pwd = st.text_input("Пароль владельца", type="password")
+        if st.button("Открыть админ-панель"):
+            if pwd == ADMIN_PASSWORD:
+                st.session_state["is_admin"] = True
+                st.experimental_rerun()
+            else:
+                st.error("Неверный пароль.")
+    # Если нажали «Я владелец» и прошли
+    if st.session_state.get("is_admin"):
+        admin_view()
+    return False
+
+# =========================
+# ------ УТИЛИТЫ APP ------
+# =========================
+
 def ensure_dir(p: pathlib.Path):
     p.mkdir(parents=True, exist_ok=True)
 
@@ -60,7 +203,6 @@ def new_unique_root(name_hint: str | None = None) -> pathlib.Path:
 def parse_input_urls(text: str) -> list[str]:
     return [u.strip() for u in (text or "").splitlines() if u.strip()]
 
-# ---------- HTTP Session ----------
 def make_http_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({
@@ -80,7 +222,7 @@ def make_http_session() -> requests.Session:
     s.mount("https://", adapter)
     return s
 
-# ---------- WB ----------
+# ---------- WB helpers ----------
 def extract_nm_id(url: str) -> str | None:
     try:
         u = urlparse(url)
@@ -117,7 +259,7 @@ def parse_basics(prod: dict) -> tuple[str | None, str | None, int]:
 def candidate_image_urls(nm_id: int, idx: int) -> list[str]:
     vol = nm_id // 100000
     part = nm_id // 1000
-    exts = (".webp", ".jpg")  # webp быстрее/легче — пробуем первым
+    exts = (".webp", ".jpg")
     baskets = [f"https://basket-{i:02d}.wb.ru" for i in range(1, 33)]
     baskets += [f"https://basket-{i:02d}.wbbasket.ru" for i in range(1, 33)]
     urls = []
@@ -127,7 +269,7 @@ def candidate_image_urls(nm_id: int, idx: int) -> list[str]:
             urls.append(base + ext)
     return urls
 
-# ---------- Загрузка ----------
+# ---------- Загрузки ----------
 def download_one_image(session: requests.Session, urls: list[str], dest_path: pathlib.Path) -> bool:
     if dest_path.with_suffix(".webp").exists() or dest_path.with_suffix(".jpg").exists():
         return True
@@ -165,7 +307,6 @@ def download_product_images_fast(session: requests.Session, nm: int, pics: int, 
 def download_product_images_detailed(session: requests.Session, nm: int, pics: int,
                                      subdir: pathlib.Path,
                                      progress_bar, status_text) -> int:
-    """Последовательно — чтобы безопасно обновлять UI по каждому слайду."""
     ensure_dir(subdir)
     saved = 0
     progress_bar.progress(0.0)
@@ -181,11 +322,9 @@ def download_product_images_detailed(session: requests.Session, nm: int, pics: i
 def detect_max_slides(root: pathlib.Path) -> int:
     max_slides = 0
     for sub in root.iterdir():
-        if not sub.is_dir():
-            continue
+        if not sub.is_dir(): continue
         imgs = list(sub.glob("*.jpg")) + list(sub.glob("*.webp"))
-        if not imgs:
-            continue
+        if not imgs: continue
         local_max = 0
         for p in imgs:
             try:
@@ -216,7 +355,7 @@ def save_excel_with_images(root: pathlib.Path,
                            cell_h_px: int = 160) -> pathlib.Path:
     out = root / "listing_matrix.xlsx"
     with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
-        # --- Сводка (колонки на русском) ---
+        # --- Сводка на русском ---
         df_sum = pd.DataFrame(summary_rows)
         if not df_sum.empty:
             cols = ["Конкурент", "Артикул", "Бренд", "Наименование", "Слайды", "Папка"]
@@ -264,20 +403,16 @@ def save_excel_with_images(root: pathlib.Path,
 # ---------- Коллаж ----------
 def save_collage(root: pathlib.Path, limit_slides: int = 10) -> pathlib.Path | None:
     competitors = sorted([p for p in root.iterdir() if p.is_dir()])
-    if not competitors:
-        return None
-    grid = []
-    max_rows = 0
+    if not competitors: return None
+    grid, max_rows = [], 0
     for c in competitors:
         imgs = sorted(list(c.glob("*.jpg")) + list(c.glob("*.webp")),
                       key=lambda p: (int(p.stem) if p.stem.isdigit() else 9999))
         imgs = imgs[:limit_slides]
         max_rows = max(max_rows, len(imgs))
         grid.append(imgs)
-    if max_rows == 0:
-        return None
-    cols = len(grid)
-    rows = max_rows
+    if max_rows == 0: return None
+    cols, rows = len(grid), max_rows
     cell_w, cell_h = THUMB
     pad = 10
     W = cols * cell_w + (cols + 1) * pad
@@ -308,9 +443,23 @@ def make_zip_bytes(root: pathlib.Path) -> bytes:
     mem.seek(0)
     return mem.read()
 
-# ---------- Интерфейс ----------
+# =========================
+# --------- UI -----------
+# =========================
+
+st.set_page_config(page_title="WB Competitors Saver (FAST + Progress)", page_icon="⚡", layout="wide")
+st.title("⚡ WB анализ листинга")
+st.caption(
+    "Вставь ссылки WB (по одной в строке) → нажми **«Сгенерировать пакет»**.\n"
+    "Сервис параллельно скачает фото по артикулам, соберёт **Excel с картинками**, **коллаж** и **ZIP**."
+)
+
+# --- Авторизационный шлюз ---
+if not auth_gate():
+    st.stop()
+
 with st.form("form_links"):
-    urls_text = st.text_area("Ссылки на товары WB (по одной на строке)", height=160)
+    urls_text = st.text_area("Ссылки на товары WB (по одной в строке)", height=160)
     session_name = st.text_input("Имя набора (необязательно)", placeholder="Анализ_товаров")
     detailed = st.checkbox("Детальный прогресс (по фото)", value=True)
     c1, c2 = st.columns(2)
@@ -321,12 +470,9 @@ with st.form("form_links"):
 
 # состояние (в памяти)
 for key, default in [
-    ("zip_bytes", None),
-    ("zip_name", None),
-    ("excel_bytes", None),
-    ("excel_name", None),
-    ("collage_bytes", None),
-    ("collage_name", None),
+    ("zip_bytes", None), ("zip_name", None),
+    ("excel_bytes", None), ("excel_name", None),
+    ("collage_bytes", None), ("collage_name", None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -373,7 +519,6 @@ if do_generate:
             encoding="utf-8"
         )
 
-        # Детальный блок по товару
         exp = st.expander(f"📦 {idx}/{total} • nm={nm} • {title or 'Без названия'}", expanded=True if detailed else False)
         with exp:
             pbar = st.progress(0.0)
@@ -393,7 +538,6 @@ if do_generate:
 
         overall.progress(idx/total)
 
-    # Сводка/Excel/Коллаж
     competitors = sorted([p for p in root.iterdir() if p.is_dir()])
     summary_rows = []
     for sub in competitors:
@@ -422,7 +566,6 @@ if do_generate:
                                        cell_w_px=CELL_PX[0], cell_h_px=CELL_PX[1])
     collage_path = save_collage(root, min(max_slides, 10))
 
-    # Читаем файлы в память
     with open(xlsx_path, "rb") as f:
         excel_bytes = f.read()
     excel_name = xlsx_path.name
@@ -434,17 +577,14 @@ if do_generate:
             collage_bytes = f.read()
         collage_name = collage_path.name
 
-    # ZIP
     zip_bytes = make_zip_bytes(root)
     zip_name = f"{root.name}.zip"
 
-    # Удаляем папку на сервере
     try:
         shutil.rmtree(root, ignore_errors=True)
     except Exception:
         pass
 
-    # Кладём в сессию
     st.session_state["zip_bytes"] = zip_bytes
     st.session_state["zip_name"] = zip_name
     st.session_state["excel_bytes"] = excel_bytes
@@ -457,7 +597,6 @@ if do_generate:
     if collage_name:
         st.write(f"🖼 Коллаж: {collage_name}")
 
-    # Кнопки скачивания
     if st.session_state["excel_bytes"]:
         st.download_button("⬇️ Скачать только Excel",
                            data=st.session_state["excel_bytes"],
