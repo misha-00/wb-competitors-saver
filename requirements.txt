@@ -4,3 +4,4 @@ pandas
 pillow
 xlsxwriter
 urllib3>=2
+aiohttp>=3.9  
