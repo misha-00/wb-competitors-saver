@@ -1,6 +1,6 @@
 # wb_competitors_app.py
-# Быстро + детальный прогресс по фото + уникальные папки + автоочистка
-# Заголовки/капшен — как ты попросил. Колонки сводки — на русском.
+# Быстро + оптимизация под облако + детальный прогресс (опционально)
+# Колонки сводки — на русском.
 
 import re
 import io
@@ -10,6 +10,9 @@ import zipfile
 import shutil
 import pathlib
 import concurrent.futures as cf
+import time
+import random
+
 import requests
 import streamlit as st
 import pandas as pd
@@ -20,19 +23,33 @@ from urllib.parse import urlparse, parse_qs
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# ---------- Режимы ----------
+CLOUD_MODE = True               # True на облаке / False локально
+DETAILED_DEFAULT = False        # детальный прогресс по умолчанию (на облаке выключен)
+
 # ---------- Параметры ----------
-MAX_WORKERS = 24               # общий параллелизм по товарам (быстрый режим)
-PER_PRODUCT_WORKERS = 8        # параллелизм по слайдам внутри товара (быстрый режим)
-REQ_TIMEOUT = (5, 12)          # (connect, read)
+if CLOUD_MODE:
+    MAX_WORKERS = 8             # общий параллелизм по товарам
+    PER_PRODUCT_WORKERS = 3     # параллелизм по слайдам
+    BASKET_MAX = 8              # сколько «корзин» WB перебирать
+    PROGRESS_EVERY = 3          # как часто обновлять прогресс (каждые N слайдов)
+    SLEEP_MIN, SLEEP_MAX = 0.05, 0.15  # рандомная задержка между запросами
+else:
+    MAX_WORKERS = 24
+    PER_PRODUCT_WORKERS = 8
+    BASKET_MAX = 32
+    PROGRESS_EVERY = 1
+    SLEEP_MIN, SLEEP_MAX = 0.0, 0.0
+
+REQ_TIMEOUT = (5, 12)           # (connect, read)
 RETRY_TOTAL = 2
-DEFAULT_SLIDES = 10            # если WB не вернул pics
-THUMB = (360, 360)             # превью в коллаже
-CELL_PX = (160, 160)           # размер картинки в Excel (ширина, высота)
+DEFAULT_SLIDES = 10             # если WB не вернул pics
+THUMB = (360, 360)              # превью в коллаже
+CELL_PX = (160, 160)            # размер картинки в Excel (ширина, высота)
 
 # ---------- UI ----------
 st.set_page_config(page_title="WB Competitors Saver (FAST + Progress)", page_icon="⚡", layout="wide")
 st.title("⚡ WB анализ листинга")
-
 st.caption(
     "Вставь ссылки WB (по одной в строке) → нажми **«Сгенерировать пакет»**.\n"
     "Сервис параллельно скачает фото по артикулам, соберёт **Excel с картинками**, **коллаж** и **ZIP**."
@@ -118,8 +135,8 @@ def candidate_image_urls(nm_id: int, idx: int) -> list[str]:
     vol = nm_id // 100000
     part = nm_id // 1000
     exts = (".webp", ".jpg")  # webp быстрее/легче — пробуем первым
-    baskets = [f"https://basket-{i:02d}.wb.ru" for i in range(1, 33)]
-    baskets += [f"https://basket-{i:02d}.wbbasket.ru" for i in range(1, 33)]
+    baskets = [f"https://basket-{i:02d}.wb.ru" for i in range(1, BASKET_MAX + 1)]
+    baskets += [f"https://basket-{i:02d}.wbbasket.ru" for i in range(1, BASKET_MAX + 1)]
     urls = []
     for host in baskets:
         base = f"{host}/vol{vol}/part{part}/{nm_id}/images/big/{idx}"
@@ -129,6 +146,7 @@ def candidate_image_urls(nm_id: int, idx: int) -> list[str]:
 
 # ---------- Загрузка ----------
 def download_one_image(session: requests.Session, urls: list[str], dest_path: pathlib.Path) -> bool:
+    # не перекачиваем уже сохранённое
     if dest_path.with_suffix(".webp").exists() or dest_path.with_suffix(".jpg").exists():
         return True
     for u in urls:
@@ -138,9 +156,15 @@ def download_one_image(session: requests.Session, urls: list[str], dest_path: pa
                 ext = ".webp" if u.endswith(".webp") else ".jpg"
                 with open(dest_path.with_suffix(ext), "wb") as f:
                     f.write(r.content)
+                # мягкий анти-лимит на облаке
+                if SLEEP_MIN or SLEEP_MAX:
+                    time.sleep(random.uniform(SLEEP_MIN, SLEEP_MAX))
                 return True
         except Exception:
             pass
+    # небольшая задержка даже при неудаче, чтобы не долбить CDN
+    if SLEEP_MIN or SLEEP_MAX:
+        time.sleep(random.uniform(SLEEP_MIN, SLEEP_MAX))
     return False
 
 def download_product_images_fast(session: requests.Session, nm: int, pics: int, subdir: pathlib.Path) -> int:
@@ -165,7 +189,7 @@ def download_product_images_fast(session: requests.Session, nm: int, pics: int, 
 def download_product_images_detailed(session: requests.Session, nm: int, pics: int,
                                      subdir: pathlib.Path,
                                      progress_bar, status_text) -> int:
-    """Последовательно — чтобы безопасно обновлять UI по каждому слайду."""
+    """Последовательно — чтобы безопасно обновлять UI по каждому слайду (на облаке реже обновляем прогресс)."""
     ensure_dir(subdir)
     saved = 0
     progress_bar.progress(0.0)
@@ -173,8 +197,9 @@ def download_product_images_detailed(session: requests.Session, nm: int, pics: i
         urls = candidate_image_urls(nm, i)
         ok = download_one_image(session, urls, subdir / f"{i}")
         saved += 1 if ok else 0
-        status_text.write(f"Слайд {i}/{pics} — {'OK' if ok else 'пропуск'}")
-        progress_bar.progress(i / pics)
+        if (i % PROGRESS_EVERY == 0) or (i == pics):
+            status_text.write(f"Слайд {i}/{pics} — {'OK' if ok else 'пропуск'}")
+            progress_bar.progress(i / pics)
     return saved
 
 # ---------- Подсчёт слайдов ----------
@@ -312,7 +337,7 @@ def make_zip_bytes(root: pathlib.Path) -> bytes:
 with st.form("form_links"):
     urls_text = st.text_area("Ссылки на товары WB (по одной на строке)", height=160)
     session_name = st.text_input("Имя набора (необязательно)", placeholder="Анализ_товаров")
-    detailed = st.checkbox("Детальный прогресс (по фото)", value=True)
+    detailed = st.checkbox("Детальный прогресс (по фото)", value=DETAILED_DEFAULT)
     c1, c2 = st.columns(2)
     with c1:
         do_generate = st.form_submit_button("🚀 Сгенерировать пакет")
@@ -490,4 +515,4 @@ if do_download_zip:
         st.download_button("⬇️ Скачать архив (всё вместе)",
                            data=st.session_state["zip_bytes"],
                            file_name=st.session_state["zip_name"],
-                           mime="application/zip") 
+                           mime="application/zip")
