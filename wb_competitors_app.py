@@ -490,4 +490,4 @@ if do_download_zip:
         st.download_button("⬇️ Скачать архив (всё вместе)",
                            data=st.session_state["zip_bytes"],
                            file_name=st.session_state["zip_name"],
-                           mime="application/zip")
+                           mime="application/zip") 
