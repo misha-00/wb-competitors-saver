@@ -1,7 +1,7 @@
 # wb_competitors_app.py
-# Рабочий функционал + доступ по одноразовым ключам + админ-панель владельца
+# Быстро + детальный прогресс по фото + уникальные папки + автоочистка
+# Заголовки/капшен — как ты попросил. Колонки сводки — на русском.
 
-import os
 import re
 import io
 import json
@@ -9,34 +9,18 @@ import math
 import zipfile
 import shutil
 import pathlib
-import secrets
 import concurrent.futures as cf
 import requests
 import streamlit as st
 import pandas as pd
 from PIL import Image
 from io import BytesIO
-from datetime import datetime, timedelta
+from datetime import datetime
 from urllib.parse import urlparse, parse_qs
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ==========================
-# НАСТРОЙКИ ДОСТУПА
-# ==========================
-# 1) Пароль владельца. В проде можно брать из Secrets/ENV:
-# ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD") or os.environ.get("ADMIN_PASSWORD") or "ChangeMe!"
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD") or "Misha0410!"  # ← поменяй при деплое
-
-# 2) Файл с ключами (рядом с приложением)
-AUTH_STORE_PATH = pathlib.Path("auth_store.json")
-
-# 3) Срок действия ключей по умолчанию (часы)
-TOKEN_TTL_HOURS_DEFAULT = 24
-
-# ==========================
-# ПАРАМЕТРЫ ПАРСЕРА/ИНТЕРФЕЙСА
-# ==========================
+# ---------- Параметры ----------
 MAX_WORKERS = 24               # общий параллелизм по товарам (быстрый режим)
 PER_PRODUCT_WORKERS = 8        # параллелизм по слайдам внутри товара (быстрый режим)
 REQ_TIMEOUT = (5, 12)          # (connect, read)
@@ -47,189 +31,8 @@ CELL_PX = (160, 160)           # размер картинки в Excel (шир�
 
 # ---------- UI ----------
 st.set_page_config(page_title="WB Competitors Saver (FAST + Progress)", page_icon="⚡", layout="wide")
-
-# после st.set_page_config(...)
-if "mode" not in st.session_state:
-    st.session_state["mode"] = "auth"   # стартуем со страницы входа
-    
-# ==========================
-# ХЕЛПЕРЫ ХРАНИЛИЩА КЛЮЧЕЙ
-# ==========================
-def _load_store() -> dict:
-    if AUTH_STORE_PATH.exists():
-        try:
-            return json.loads(AUTH_STORE_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {"tokens": {}}  # token -> {issued_at, expires_at, used, note}
-
-
-def _save_store(store: dict):
-    AUTH_STORE_PATH.write_text(json.dumps(store, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def _gen_token(n_chars: int = 16) -> str:
-    return secrets.token_urlsafe(n_chars)[:n_chars]
-
-
-def issue_tokens(n: int, ttl_hours: int, note: str | None = None) -> list[dict]:
-    """Создать n одноразовых ключей с заданным сроком.
-    Возвращает список словарей {token, expires_at, note}."""
-    store = _load_store()
-    out = []
-    now = datetime.utcnow()
-    exp = now + timedelta(hours=int(ttl_hours))
-    for _ in range(int(n)):
-        token = _gen_token(16)
-        while token in store["tokens"]:
-            token = _gen_token(16)
-        store["tokens"][token] = {
-            "issued_at": now.isoformat(),
-            "expires_at": exp.isoformat(),
-            "used": False,
-            "note": note or "",
-        }
-        out.append({"token": token, "expires_at": exp.isoformat(), "note": note or ""})
-    _save_store(store)
-    return out
-
-
-def validate_and_consume_token(token: str) -> tuple[bool, str]:
-    """Проверить ключ и пометить как использованный при успехе."""
-    token = (token or "").strip()
-    if not token:
-        return False, "Ключ пустой."
-    store = _load_store()
-    meta = store["tokens"].get(token)
-    if not meta:
-        return False, "Ключ не найден."
-    if meta.get("used"):
-        return False, "Ключ уже использован."
-    try:
-        exp = datetime.fromisoformat(meta["expires_at"])
-    except Exception:
-        exp = datetime.utcnow() - timedelta(seconds=1)
-    if datetime.utcnow() > exp:
-        return False, "Срок действия ключа истёк."
-    # помечаем использованным
-    meta["used"] = True
-    store["tokens"][token] = meta
-    _save_store(store)
-    return True, "Доступ разрешён."
-
-
-def drop_expired_tokens() -> int:
-    """Удалить все просроченные ключи. Возвращает количество удалённых."""
-    store = _load_store()
-    removed = 0
-    now = datetime.utcnow()
-    kept = {}
-    for k, v in store["tokens"].items():
-        try:
-            exp = datetime.fromisoformat(v.get("expires_at", ""))
-        except Exception:
-            exp = now - timedelta(seconds=1)
-        if now <= exp:
-            kept[k] = v
-        else:
-            removed += 1
-    store["tokens"] = kept
-    _save_store(store)
-    return removed
-
-
-# ==========================
-# АДМИН-ПАНЕЛЬ
-# ==========================
-def admin_view():
-    st.subheader("🔐 Админ-панель — выдача одноразовых ключей")
-
-    with st.form("issue_form"):
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            note = st.text_input("Заметка (кому/для чего)", placeholder="Клиент: Иванов, тариф PRO")
-        with col2:
-            ttl = st.number_input("Срок (часов)", min_value=1, max_value=168, value=TOKEN_TTL_HOURS_DEFAULT, step=1)
-        count = st.number_input("Сколько ключей выдать", min_value=1, max_value=200, value=5, step=1)
-        btn = st.form_submit_button("Сгенерировать ключи")
-
-    if btn:
-        tokens = issue_tokens(int(count), int(ttl), (note or "").strip())
-        st.success("Ключи сгенерированы:")
-        joined = "\n".join(t["token"] for t in tokens)
-        st.code(joined)
-        st.download_button("⬇️ Скачать .txt", data=joined, file_name="tokens.txt", mime="text/plain")
-        st.text_area("Быстро скопировать", value=joined, height=140, label_visibility="collapsed")
-
-    with st.expander("📋 Активные ключи / история"):
-        store = _load_store()
-        rows = []
-        for k, v in store["tokens"].items():
-            rows.append({
-                "token": k,
-                "used": v.get("used"),
-                "expires_at": v.get("expires_at"),
-                "note": v.get("note", "")
-            })
-        if rows:
-            df = pd.DataFrame(rows).sort_values(by=["used", "expires_at"])
-            st.dataframe(df, use_container_width=True, height=320)
-        else:
-            st.info("Ключей пока нет.")
-
-        colA, colB = st.columns(2)
-        with colA:
-            if st.button("🧹 Удалить все просроченные"):
-                n = drop_expired_tokens()
-                st.success(f"Удалено просроченных ключей: {n}")
-                st.rerun()
-        with colB:
-            if st.button("🔄 Обновить список"):
-                st.rerun()
-
-
-# ==========================
-# АВТОРИЗАЦИЯ (ГЕЙТ)
-# ==========================
-def auth_gate():
-    """Показывает экран входа и переводит в нужный режим."""
-    # если уже в приложении/админке — просто выходим
-    if st.session_state.get("mode") in ("admin", "app"):
-        return
-
-    st.title("🔑 Доступ по ключу")
-
-    # --- вход по одноразовому токену ---
-    with st.form("auth_token_form"):
-        token = st.text_input("Ключ доступа", type="password", placeholder="одноразовый ключ")
-        ok = st.form_submit_button("Войти")
-    if ok:
-        success, msg = validate_and_consume_token(token)
-        if success:
-            st.session_state["authed"] = True
-            st.session_state["mode"] = "app"     # пускаем в приложение
-            st.rerun()
-        else:
-            st.error(msg)
-
-    st.divider()
-    st.subheader("Я владелец")
-
-    # --- вход владельца ---
-    with st.form("admin_login_form"):
-        admin_pwd = st.text_input("Пароль владельца", type="password", placeholder="ADMIN_PASSWORD")
-        admin_ok = st.form_submit_button("Открыть админ-панель")
-    if admin_ok:
-        if admin_pwd == ADMIN_PASSWORD:
-            st.session_state["is_admin"] = True
-            st.session_state["mode"] = "admin"   # идём в админку
-            st.rerun()
-        else:
-            st.error("Неверный пароль владельца.")
-# ==========================
-# ДАЛЬШЕ — ТВОЙ РАБОЧИЙ ФУНКЦИОНАЛ
-# ==========================
 st.title("⚡ WB анализ листинга")
+
 st.caption(
     "Вставь ссылки WB (по одной в строке) → нажми **«Сгенерировать пакет»**.\n"
     "Сервис параллельно скачает фото по артикулам, соберёт **Excel с картинками**, **коллаж** и **ZIP**."
@@ -314,7 +117,7 @@ def parse_basics(prod: dict) -> tuple[str | None, str | None, int]:
 def candidate_image_urls(nm_id: int, idx: int) -> list[str]:
     vol = nm_id // 100000
     part = nm_id // 1000
-    exts = (".webp", ".jpg")
+    exts = (".webp", ".jpg")  # webp быстрее/легче — пробуем первым
     baskets = [f"https://basket-{i:02d}.wb.ru" for i in range(1, 33)]
     baskets += [f"https://basket-{i:02d}.wbbasket.ru" for i in range(1, 33)]
     urls = []
@@ -362,6 +165,7 @@ def download_product_images_fast(session: requests.Session, nm: int, pics: int, 
 def download_product_images_detailed(session: requests.Session, nm: int, pics: int,
                                      subdir: pathlib.Path,
                                      progress_bar, status_text) -> int:
+    """Последовательно — чтобы безопасно обновлять UI по каждому слайду."""
     ensure_dir(subdir)
     saved = 0
     progress_bar.progress(0.0)
@@ -412,14 +216,14 @@ def save_excel_with_images(root: pathlib.Path,
                            cell_h_px: int = 160) -> pathlib.Path:
     out = root / "listing_matrix.xlsx"
     with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
-        # Сводка
+        # --- Сводка (колонки на русском) ---
         df_sum = pd.DataFrame(summary_rows)
         if not df_sum.empty:
             cols = ["Конкурент", "Артикул", "Бренд", "Наименование", "Слайды", "Папка"]
             df_sum = df_sum[[c for c in cols if c in df_sum.columns]]
         df_sum.to_excel(writer, sheet_name="Сводка", index=False)
 
-        # Матрица
+        # --- Матрица изображений ---
         wb = writer.book
         ws = wb.add_worksheet("Матрица")
 
@@ -504,208 +308,186 @@ def make_zip_bytes(root: pathlib.Path) -> bytes:
     mem.seek(0)
     return mem.read()
 
-# ---------- Основной интерфейс (доступен после авторизации) ----------
-def main_app():
-    with st.form("form_links"):
-        urls_text = st.text_area("Ссылки на товары WB (по одной на строке)", height=160)
-        session_name = st.text_input("Имя набора (необязательно)", placeholder="Анализ_товаров")
-        detailed = st.checkbox("Детальный прогресс (по фото)", value=True)
-        c1, c2 = st.columns(2)
-        with c1:
-            do_generate = st.form_submit_button("🚀 Сгенерировать пакет")
-        with c2:
-            do_download_zip = st.form_submit_button("⬇️ Скачать архив")
+# ---------- Интерфейс ----------
+with st.form("form_links"):
+    urls_text = st.text_area("Ссылки на товары WB (по одной на строке)", height=160)
+    session_name = st.text_input("Имя набора (необязательно)", placeholder="Анализ_товаров")
+    detailed = st.checkbox("Детальный прогресс (по фото)", value=True)
+    c1, c2 = st.columns(2)
+    with c1:
+        do_generate = st.form_submit_button("🚀 Сгенерировать пакет")
+    with c2:
+        do_download_zip = st.form_submit_button("⬇️ Скачать архив")
 
-    # состояние (в памяти)
-    for key, default in [
-        ("zip_bytes", None),
-        ("zip_name", None),
-        ("excel_bytes", None),
-        ("excel_name", None),
-        ("collage_bytes", None),
-        ("collage_name", None),
-    ]:
-        if key not in st.session_state:
-            st.session_state[key] = default
+# состояние (в памяти)
+for key, default in [
+    ("zip_bytes", None),
+    ("zip_name", None),
+    ("excel_bytes", None),
+    ("excel_name", None),
+    ("collage_bytes", None),
+    ("collage_name", None),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
-    # ---------- Генерация ----------
-    if do_generate:
-        links = parse_input_urls(urls_text)
-        if not links:
-            st.error("Добавь хотя бы одну ссылку."); st.stop()
+# ---------- Генерация ----------
+if do_generate:
+    links = parse_input_urls(urls_text)
+    if not links:
+        st.error("Добавь хотя бы одну ссылку."); st.stop()
 
-        root = new_unique_root(session_name)
-        session = make_http_session()
+    root = new_unique_root(session_name)
+    session = make_http_session()
 
-        overall = st.progress(0.0)
-        overall_text = st.empty()
+    overall = st.progress(0.0)
+    overall_text = st.empty()
 
-        ok_list, err_list = [], []
-        total = len(links)
+    ok_list, err_list = [], []
+    total = len(links)
 
-        for idx, url in enumerate(links, start=1):
-            overall_text.write(f"Товар {idx}/{total}: {url}")
+    for idx, url in enumerate(links, start=1):
+        overall_text.write(f"Товар {idx}/{total}: {url}")
 
-            nm_raw = extract_nm_id(url)
-            if not nm_raw:
-                err_list.append((url, "Не найден артикул (nm_id)"))
-                overall.progress(idx/total); continue
+        nm_raw = extract_nm_id(url)
+        if not nm_raw:
+            err_list.append((url, "Не найден артикул (nm_id)"))
+            overall.progress(idx/total); continue
 
-            nm = int(nm_raw)
-            try:
-                prod = fetch_card_json(session, nm_raw)
-            except Exception as e:
-                err_list.append((url, f"API ошибка: {e}"))
-                overall.progress(idx/total); continue
-
-            title, brand, pics = parse_basics(prod)
-            if pics <= 0:
-                pics = DEFAULT_SLIDES
-
-            subdir = root / f"{idx:03d}_{nm}"
-            ensure_dir(subdir)
-            (subdir / "meta.json").write_text(
-                json.dumps({"url": url, "nm_id": nm, "title": title, "brand": brand,
-                            "saved_at": datetime.now().isoformat()}, ensure_ascii=False, indent=2),
-                encoding="utf-8"
-            )
-
-            exp = st.expander(f"📦 {idx}/{total} • nm={nm} • {title or 'Без названия'}", expanded=True if detailed else False)
-            with exp:
-                pbar = st.progress(0.0)
-                line = st.empty()
-                if detailed:
-                    saved = download_product_images_detailed(session, nm, pics, subdir, pbar, line)
-                else:
-                    line.write("Скачиваю изображения (ускоренный режим)…")
-                    saved = download_product_images_fast(session, nm, pics, subdir)
-                    pbar.progress(1.0)
-                    line.write(f"Готово: сохранено {saved} из ~{pics}")
-
-            if saved > 0:
-                ok_list.append((url, subdir.name, saved))
-            else:
-                err_list.append((url, "Не удалось сохранить изображения"))
-
-            overall.progress(idx/total)
-
-        # Сводка/Excel/Коллаж
-        competitors = sorted([p for p in root.iterdir() if p.is_dir()])
-        summary_rows = []
-        for sub in competitors:
-            nm = sub.name.split("_")[-1]
-            imgs = sorted(list(sub.glob("*.jpg")) + list(sub.glob("*.webp")),
-                          key=lambda p: (int(p.stem) if p.stem.isdigit() else 9999))
-            title = brand = None
-            meta = sub / "meta.json"
-            if meta.exists():
-                try:
-                    m = json.loads(meta.read_text(encoding="utf-8"))
-                    title, brand = m.get("title"), m.get("brand")
-                except Exception:
-                    pass
-            summary_rows.append({
-                "Конкурент": sub.name.split("_")[0],
-                "Артикул": nm,
-                "Бренд": brand,
-                "Наименование": title,
-                "Слайды": len(imgs),
-                "Папка": sub.name,
-            })
-
-        max_slides = detect_max_slides(root)
-        xlsx_path = save_excel_with_images(root, summary_rows, limit_slides=max_slides,
-                                           cell_w_px=CELL_PX[0], cell_h_px=CELL_PX[1])
-        collage_path = save_collage(root, min(max_slides, 10))
-
-        # Читаем файлы в память
-        with open(xlsx_path, "rb") as f:
-            excel_bytes = f.read()
-        excel_name = xlsx_path.name
-
-        collage_bytes = None
-        collage_name = None
-        if collage_path and collage_path.exists():
-            with open(collage_path, "rb") as f:
-                collage_bytes = f.read()
-            collage_name = collage_path.name
-
-        # ZIP
-        zip_bytes = make_zip_bytes(root)
-        zip_name = f"{root.name}.zip"
-
-        # Удаляем папку на сервере
+        nm = int(nm_raw)
         try:
-            shutil.rmtree(root, ignore_errors=True)
-        except Exception:
-            pass
+            prod = fetch_card_json(session, nm_raw)
+        except Exception as e:
+            err_list.append((url, f"API ошибка: {e}"))
+            overall.progress(idx/total); continue
 
-        # Кладём в сессию
-        st.session_state["zip_bytes"] = zip_bytes
-        st.session_state["zip_name"] = zip_name
-        st.session_state["excel_bytes"] = excel_bytes
-        st.session_state["excel_name"] = excel_name
-        st.session_state["collage_bytes"] = collage_bytes
-        st.session_state["collage_name"] = collage_name
+        title, brand, pics = parse_basics(prod)
+        if pics <= 0:
+            pics = DEFAULT_SLIDES
 
-        st.success("Готово! Пакет сформирован. Временная папка удалена.")
-        st.write(f"📊 Excel: {excel_name}")
-        if collage_name:
-            st.write(f"🖼 Коллаж: {collage_name}")
+        subdir = root / f"{idx:03d}_{nm}"
+        ensure_dir(subdir)
+        (subdir / "meta.json").write_text(
+            json.dumps({"url": url, "nm_id": nm, "title": title, "brand": brand,
+                        "saved_at": datetime.now().isoformat()}, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
 
-        # Кнопки скачивания
-        if st.session_state["excel_bytes"]:
-            st.download_button("⬇️ Скачать только Excel",
-                               data=st.session_state["excel_bytes"],
-                               file_name=st.session_state["excel_name"],
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        if st.session_state["collage_bytes"]:
-            st.download_button("⬇️ Скачать только коллаж (JPG)",
-                               data=st.session_state["collage_bytes"],
-                               file_name=st.session_state["collage_name"],
-                               mime="image/jpeg")
+        # Детальный блок по товару
+        exp = st.expander(f"📦 {idx}/{total} • nm={nm} • {title or 'Без названия'}", expanded=True if detailed else False)
+        with exp:
+            pbar = st.progress(0.0)
+            line = st.empty()
+            if detailed:
+                saved = download_product_images_detailed(session, nm, pics, subdir, pbar, line)
+            else:
+                line.write("Скачиваю изображения (ускоренный режим)…")
+                saved = download_product_images_fast(session, nm, pics, subdir)
+                pbar.progress(1.0)
+                line.write(f"Готово: сохранено {saved} из ~{pics}")
+
+        if saved > 0:
+            ok_list.append((url, subdir.name, saved))
+        else:
+            err_list.append((url, "Не удалось сохранить изображения"))
+
+        overall.progress(idx/total)
+
+    # Сводка/Excel/Коллаж
+    competitors = sorted([p for p in root.iterdir() if p.is_dir()])
+    summary_rows = []
+    for sub in competitors:
+        nm = sub.name.split("_")[-1]
+        imgs = sorted(list(sub.glob("*.jpg")) + list(sub.glob("*.webp")),
+                      key=lambda p: (int(p.stem) if p.stem.isdigit() else 9999))
+        title = brand = None
+        meta = sub / "meta.json"
+        if meta.exists():
+            try:
+                m = json.loads(meta.read_text(encoding="utf-8"))
+                title, brand = m.get("title"), m.get("brand")
+            except Exception:
+                pass
+        summary_rows.append({
+            "Конкурент": sub.name.split("_")[0],
+            "Артикул": nm,
+            "Бренд": brand,
+            "Наименование": title,
+            "Слайды": len(imgs),
+            "Папка": sub.name,
+        })
+
+    max_slides = detect_max_slides(root)
+    xlsx_path = save_excel_with_images(root, summary_rows, limit_slides=max_slides,
+                                       cell_w_px=CELL_PX[0], cell_h_px=CELL_PX[1])
+    collage_path = save_collage(root, min(max_slides, 10))
+
+    # Читаем файлы в память
+    with open(xlsx_path, "rb") as f:
+        excel_bytes = f.read()
+    excel_name = xlsx_path.name
+
+    collage_bytes = None
+    collage_name = None
+    if collage_path and collage_path.exists():
+        with open(collage_path, "rb") as f:
+            collage_bytes = f.read()
+        collage_name = collage_path.name
+
+    # ZIP
+    zip_bytes = make_zip_bytes(root)
+    zip_name = f"{root.name}.zip"
+
+    # Удаляем папку на сервере
+    try:
+        shutil.rmtree(root, ignore_errors=True)
+    except Exception:
+        pass
+
+    # Кладём в сессию
+    st.session_state["zip_bytes"] = zip_bytes
+    st.session_state["zip_name"] = zip_name
+    st.session_state["excel_bytes"] = excel_bytes
+    st.session_state["excel_name"] = excel_name
+    st.session_state["collage_bytes"] = collage_bytes
+    st.session_state["collage_name"] = collage_name
+
+    st.success("Готово! Пакет сформирован. Временная папка удалена.")
+    st.write(f"📊 Excel: {excel_name}")
+    if collage_name:
+        st.write(f"🖼 Коллаж: {collage_name}")
+
+    # Кнопки скачивания
+    if st.session_state["excel_bytes"]:
+        st.download_button("⬇️ Скачать только Excel",
+                           data=st.session_state["excel_bytes"],
+                           file_name=st.session_state["excel_name"],
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    if st.session_state["collage_bytes"]:
+        st.download_button("⬇️ Скачать только коллаж (JPG)",
+                           data=st.session_state["collage_bytes"],
+                           file_name=st.session_state["collage_name"],
+                           mime="image/jpeg")
+    st.download_button("⬇️ Скачать архив (всё вместе)",
+                       data=st.session_state["zip_bytes"],
+                       file_name=st.session_state["zip_name"],
+                       mime="application/zip")
+
+    if ok_list:
+        st.subheader("✅ Сохранены")
+        for url, folder, cnt in ok_list:
+            st.write(f"- {folder} — {cnt} фото — {url}")
+    if err_list:
+        st.subheader("⚠️ Ошибки")
+        for url, msg in err_list:
+            st.write(f"- {url}: {msg}")
+
+# Повторная выгрузка ZIP
+if do_download_zip:
+    if not st.session_state["zip_bytes"]:
+        st.error("Архив ещё не готов. Сначала нажми «Сгенерировать пакет».")
+    else:
         st.download_button("⬇️ Скачать архив (всё вместе)",
                            data=st.session_state["zip_bytes"],
                            file_name=st.session_state["zip_name"],
                            mime="application/zip")
-
-        if ok_list:
-            st.subheader("✅ Сохранены")
-            for url, folder, cnt in ok_list:
-                st.write(f"- {folder} — {cnt} фото — {url}")
-        if err_list:
-            st.subheader("⚠️ Ошибки")
-            for url, msg in err_list:
-                st.write(f"- {url}: {msg}")
-
-    # Повторная выгрузка ZIP
-    if 'do_download_zip' in locals() and do_download_zip:
-        if not st.session_state["zip_bytes"]:
-            st.error("Архив ещё не готов. Сначала нажми «Сгенерировать пакет».")
-        else:
-            st.download_button("⬇️ Скачать архив (всё вместе)",
-                               data=st.session_state["zip_bytes"],
-                               file_name=st.session_state["zip_name"],
-                               mime="application/zip")
-
-
-# ==========================
-# Запуск: сначала авторизация, затем приложение
-# ==========================
-# Роутер
-auth_gate()  # показывает экран входа, если мы ещё в режиме "auth"
-
-mode = st.session_state.get("mode", "auth")
-
-if mode == "admin":
-    # Админ-панель + кнопка перехода в приложение
-    admin_view()
-    st.sidebar.button("➡️ Перейти в приложение", on_click=lambda: st.session_state.update(mode="app"))
-elif mode == "app":
-    # Основное приложение + (если владелец) кнопка назад в админку
-    if st.session_state.get("is_admin"):
-        st.sidebar.button("⚙️ Открыть админ-панель", on_click=lambda: st.session_state.update(mode="admin"))
-    main_app()
-else:
-    # остаёмся на экране входа
-    pass
