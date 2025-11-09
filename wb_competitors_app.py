@@ -1,6 +1,5 @@
-# wb_competitors_app.py
-# Быстро + оптимизация под облако + детальный прогресс (опционально)
-# Колонки сводки — на русском.
+# wb_competitors_app.py — FAST-ASYNC версия (aiohttp)
+# Установка зависимостей: pip install aiohttp
 
 import re
 import io
@@ -9,50 +8,49 @@ import math
 import zipfile
 import shutil
 import pathlib
-import concurrent.futures as cf
+import asyncio
 import time
 import random
 
-import requests
+import aiohttp
+from aiohttp import ClientTimeout, TCPConnector
+
 import streamlit as st
 import pandas as pd
 from PIL import Image
 from io import BytesIO
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 # ---------- Режимы ----------
-CLOUD_MODE = True               # True на облаке / False локально
-DETAILED_DEFAULT = False        # детальный прогресс по умолчанию (на облаке выключен)
+CLOUD_MODE = True                 # True на облаке / False локально
+DETAILED_DEFAULT = False          # детальный прогресс по умолчанию (на облаке выключен)
 
 # ---------- Параметры ----------
 if CLOUD_MODE:
-    MAX_WORKERS = 8             # общий параллелизм по товарам
-    PER_PRODUCT_WORKERS = 3     # параллелизм по слайдам
-    BASKET_MAX = 8              # сколько «корзин» WB перебирать
-    PROGRESS_EVERY = 3          # как часто обновлять прогресс (каждые N слайдов)
-    SLEEP_MIN, SLEEP_MAX = 0.05, 0.15  # рандомная задержка между запросами
+    PER_PRODUCT_CONC = 5          # одновременных слайдов на товар
+    GLOBAL_CONN_LIMIT = 40        # общий лимит соединений aiohttp
+    BASKET_MAX = 8                # сколько «корзин» WB перебирать
+    SLEEP_MIN, SLEEP_MAX = 0.03, 0.10  # рандомная задержка между запросами (анти-лимит)
+    PROGRESS_EVERY = 3            # как часто обновлять прогресс детально
 else:
-    MAX_WORKERS = 24
-    PER_PRODUCT_WORKERS = 8
+    PER_PRODUCT_CONC = 10
+    GLOBAL_CONN_LIMIT = 80
     BASKET_MAX = 32
-    PROGRESS_EVERY = 1
     SLEEP_MIN, SLEEP_MAX = 0.0, 0.0
+    PROGRESS_EVERY = 1
 
-REQ_TIMEOUT = (5, 12)           # (connect, read)
-RETRY_TOTAL = 2
-DEFAULT_SLIDES = 10             # если WB не вернул pics
-THUMB = (360, 360)              # превью в коллаже
-CELL_PX = (160, 160)            # размер картинки в Excel (ширина, высота)
+DEFAULT_SLIDES = 10               # если WB не вернул pics
+THUMB = (360, 360)                # превью в коллаже
+CELL_PX = (160, 160)              # размер картинки в Excel (ширина, высота)
+HTTP_TIMEOUT = ClientTimeout(total=15, connect=5, sock_read=12)
 
 # ---------- UI ----------
-st.set_page_config(page_title="WB Competitors Saver (FAST + Progress)", page_icon="⚡", layout="wide")
-st.title("⚡ WB анализ листинга")
+st.set_page_config(page_title="WB Competitors Saver (FAST + ASYNC)", page_icon="⚡", layout="wide")
+st.title("⚡ WB анализ листинга (ASYNC)")
 st.caption(
     "Вставь ссылки WB (по одной в строке) → нажми **«Сгенерировать пакет»**.\n"
-    "Сервис параллельно скачает фото по артикулам, соберёт **Excel с картинками**, **коллаж** и **ZIP**."
+    "Сервис асинхронно скачает фото по артикулам, соберёт **Excel с картинками**, **коллаж** и **ZIP**."
 )
 
 # ---------- Утилиты ----------
@@ -77,26 +75,6 @@ def new_unique_root(name_hint: str | None = None) -> pathlib.Path:
 def parse_input_urls(text: str) -> list[str]:
     return [u.strip() for u in (text or "").splitlines() if u.strip()]
 
-# ---------- HTTP Session ----------
-def make_http_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "*/*",
-        "Accept-Encoding": "identity",
-        "Connection": "keep-alive",
-    })
-    retry = Retry(
-        total=RETRY_TOTAL, connect=RETRY_TOTAL, read=RETRY_TOTAL,
-        backoff_factor=0.4, status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["GET", "HEAD"])
-    )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=64, pool_maxsize=64)
-    s.mount("http://", adapter)
-    s.mount("https://", adapter)
-    return s
-
 # ---------- WB ----------
 def extract_nm_id(url: str) -> str | None:
     try:
@@ -111,13 +89,32 @@ def extract_nm_id(url: str) -> str | None:
         pass
     return None
 
-def fetch_card_json(session: requests.Session, nm: str) -> dict | None:
+def candidate_image_urls(nm_id: int, idx: int) -> list[str]:
+    vol = nm_id // 100000
+    part = nm_id // 1000
+    exts = (".webp", ".jpg")  # webp легче/быстрее
+    baskets = [f"https://basket-{i:02d}.wb.ru" for i in range(1, BASKET_MAX + 1)]
+    baskets += [f"https://basket-{i:02d}.wbbasket.ru" for i in range(1, BASKET_MAX + 1)]
+    urls = []
+    for host in baskets:
+        base = f"{host}/vol{vol}/part{part}/{nm_id}/images/big/{idx}"
+        for ext in exts:
+            urls.append(base + ext)
+    return urls
+
+async def fetch_json(session: aiohttp.ClientSession, url: str):
+    async with session.get(url) as r:
+        if r.status != 200:
+            return None
+        return await r.json()
+
+async def fetch_card_json(session: aiohttp.ClientSession, nm: str) -> dict | None:
     api = (f"https://card.wb.ru/cards/v2/detail"
            f"?appType=1&curr=rub&dest=-1257786&spp=0&nm={nm}")
-    r = session.get(api, timeout=REQ_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-    prods = data.get("data", {}).get("products", [])
+    data = await fetch_json(session, api)
+    if not data:
+        return None
+    prods = (data.get("data") or {}).get("products") or []
     return prods[0] if prods else None
 
 def parse_basics(prod: dict) -> tuple[str | None, str | None, int]:
@@ -131,75 +128,49 @@ def parse_basics(prod: dict) -> tuple[str | None, str | None, int]:
         pics = len(photos)
     return title, brand, pics
 
-def candidate_image_urls(nm_id: int, idx: int) -> list[str]:
-    vol = nm_id // 100000
-    part = nm_id // 1000
-    exts = (".webp", ".jpg")  # webp быстрее/легче — пробуем первым
-    baskets = [f"https://basket-{i:02d}.wb.ru" for i in range(1, BASKET_MAX + 1)]
-    baskets += [f"https://basket-{i:02d}.wbbasket.ru" for i in range(1, BASKET_MAX + 1)]
-    urls = []
-    for host in baskets:
-        base = f"{host}/vol{vol}/part{part}/{nm_id}/images/big/{idx}"
-        for ext in exts:
-            urls.append(base + ext)
-    return urls
-
-# ---------- Загрузка ----------
-def download_one_image(session: requests.Session, urls: list[str], dest_path: pathlib.Path) -> bool:
+# ---------- ASYNC загрузка ----------
+async def download_one_image_async(session: aiohttp.ClientSession, urls: list[str], dest_path: pathlib.Path) -> bool:
     # не перекачиваем уже сохранённое
     if dest_path.with_suffix(".webp").exists() or dest_path.with_suffix(".jpg").exists():
         return True
     for u in urls:
         try:
-            r = session.get(u, timeout=REQ_TIMEOUT, stream=False)
-            if r.status_code == 200 and int(r.headers.get("Content-Length", "1")) > 0:
-                ext = ".webp" if u.endswith(".webp") else ".jpg"
-                with open(dest_path.with_suffix(ext), "wb") as f:
-                    f.write(r.content)
-                # мягкий анти-лимит на облаке
-                if SLEEP_MIN or SLEEP_MAX:
-                    time.sleep(random.uniform(SLEEP_MIN, SLEEP_MAX))
-                return True
+            async with session.get(u) as r:
+                if r.status == 200:
+                    data = await r.read()
+                    if data and len(data) > 0:
+                        ext = ".webp" if u.endswith(".webp") else ".jpg"
+                        with open(dest_path.with_suffix(ext), "wb") as f:
+                            f.write(data)
+                        if SLEEP_MIN or SLEEP_MAX:
+                            await asyncio.sleep(random.uniform(SLEEP_MIN, SLEEP_MAX))
+                        return True
         except Exception:
             pass
-    # небольшая задержка даже при неудаче, чтобы не долбить CDN
     if SLEEP_MIN or SLEEP_MAX:
-        time.sleep(random.uniform(SLEEP_MIN, SLEEP_MAX))
+        await asyncio.sleep(random.uniform(SLEEP_MIN, SLEEP_MAX))
     return False
 
-def download_product_images_fast(session: requests.Session, nm: int, pics: int, subdir: pathlib.Path) -> int:
+async def download_product_images_async(session: aiohttp.ClientSession, nm: int, pics: int,
+                                        subdir: pathlib.Path,
+                                        detailed: bool = False,
+                                        progress_cb=None) -> int:
     ensure_dir(subdir)
+    sem = asyncio.Semaphore(PER_PRODUCT_CONC)
     saved = 0
-    tasks = list(range(1, pics + 1))
-    workers = min(PER_PRODUCT_WORKERS, max(1, math.ceil(pics / 2)))
-    with cf.ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = []
-        for i in tasks:
-            urls = candidate_image_urls(nm, i)
-            dest_stub = subdir / f"{i}"
-            futures.append(pool.submit(download_one_image, session, urls, dest_stub))
-        for fut in cf.as_completed(futures):
-            try:
-                if fut.result():
-                    saved += 1
-            except Exception:
-                pass
-    return saved
 
-def download_product_images_detailed(session: requests.Session, nm: int, pics: int,
-                                     subdir: pathlib.Path,
-                                     progress_bar, status_text) -> int:
-    """Последовательно — чтобы безопасно обновлять UI по каждому слайду (на облаке реже обновляем прогресс)."""
-    ensure_dir(subdir)
-    saved = 0
-    progress_bar.progress(0.0)
-    for i in range(1, pics + 1):
+    async def worker(i: int):
+        nonlocal saved
         urls = candidate_image_urls(nm, i)
-        ok = download_one_image(session, urls, subdir / f"{i}")
-        saved += 1 if ok else 0
-        if (i % PROGRESS_EVERY == 0) or (i == pics):
-            status_text.write(f"Слайд {i}/{pics} — {'OK' if ok else 'пропуск'}")
-            progress_bar.progress(i / pics)
+        async with sem:
+            ok = await download_one_image_async(session, urls, subdir / f"{i}")
+            if ok:
+                saved += 1
+            if detailed and progress_cb and ((i % PROGRESS_EVERY == 0) or (i == pics)):
+                await progress_cb(i, pics, ok)
+
+    tasks = [asyncio.create_task(worker(i)) for i in range(1, pics + 1)]
+    await asyncio.gather(*tasks)
     return saved
 
 # ---------- Подсчёт слайдов ----------
@@ -363,60 +334,79 @@ if do_generate:
         st.error("Добавь хотя бы одну ссылку."); st.stop()
 
     root = new_unique_root(session_name)
-    session = make_http_session()
+
+    # общий HTTP клиент для всего набора (быстрее, чем создавать на каждый товар)
+    connector = TCPConnector(limit=GLOBAL_CONN_LIMIT, ssl=False)  # ssl=False ускоряет, CDN WB без проблем
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Accept-Encoding": "identity",
+        "Connection": "keep-alive",
+    }
 
     overall = st.progress(0.0)
     overall_text = st.empty()
-
     ok_list, err_list = [], []
     total = len(links)
 
-    for idx, url in enumerate(links, start=1):
-        overall_text.write(f"Товар {idx}/{total}: {url}")
+    async def process_all():
+        async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT, connector=connector, headers=headers) as session:
+            for idx, url in enumerate(links, start=1):
+                overall_text.write(f"Товар {idx}/{total}: {url}")
 
-        nm_raw = extract_nm_id(url)
-        if not nm_raw:
-            err_list.append((url, "Не найден артикул (nm_id)"))
-            overall.progress(idx/total); continue
+                nm_raw = extract_nm_id(url)
+                if not nm_raw:
+                    err_list.append((url, "Не найден артикул (nm_id)"))
+                    overall.progress(idx/total); continue
 
-        nm = int(nm_raw)
-        try:
-            prod = fetch_card_json(session, nm_raw)
-        except Exception as e:
-            err_list.append((url, f"API ошибка: {e}"))
-            overall.progress(idx/total); continue
+                try:
+                    prod = await fetch_card_json(session, nm_raw)
+                except Exception as e:
+                    err_list.append((url, f"API ошибка: {e}"))
+                    overall.progress(idx/total); continue
 
-        title, brand, pics = parse_basics(prod)
-        if pics <= 0:
-            pics = DEFAULT_SLIDES
+                title, brand, pics = parse_basics(prod)
+                if pics <= 0:
+                    pics = DEFAULT_SLIDES
 
-        subdir = root / f"{idx:03d}_{nm}"
-        ensure_dir(subdir)
-        (subdir / "meta.json").write_text(
-            json.dumps({"url": url, "nm_id": nm, "title": title, "brand": brand,
-                        "saved_at": datetime.now().isoformat()}, ensure_ascii=False, indent=2),
-            encoding="utf-8"
-        )
+                subdir = root / f"{idx:03d}_{int(nm_raw)}"
+                ensure_dir(subdir)
+                (subdir / "meta.json").write_text(
+                    json.dumps({"url": url, "nm_id": int(nm_raw), "title": title, "brand": brand,
+                                "saved_at": datetime.now().isoformat()}, ensure_ascii=False, indent=2),
+                    encoding="utf-8"
+                )
 
-        # Детальный блок по товару
-        exp = st.expander(f"📦 {idx}/{total} • nm={nm} • {title or 'Без названия'}", expanded=True if detailed else False)
-        with exp:
-            pbar = st.progress(0.0)
-            line = st.empty()
-            if detailed:
-                saved = download_product_images_detailed(session, nm, pics, subdir, pbar, line)
-            else:
-                line.write("Скачиваю изображения (ускоренный режим)…")
-                saved = download_product_images_fast(session, nm, pics, subdir)
-                pbar.progress(1.0)
-                line.write(f"Готово: сохранено {saved} из ~{pics}")
+                exp = st.expander(f"📦 {idx}/{total} • nm={nm_raw} • {title or 'Без названия'}",
+                                  expanded=True if detailed else False)
+                with exp:
+                    pbar = st.progress(0.0)
+                    line = st.empty()
 
-        if saved > 0:
-            ok_list.append((url, subdir.name, saved))
-        else:
-            err_list.append((url, "Не удалось сохранить изображения"))
+                    async def progress_cb(i, total_i, ok_last):
+                        if (i % PROGRESS_EVERY == 0) or (i == total_i):
+                            line.write(f"Слайд {i}/{total_i} — {'OK' if ok_last else 'пропуск'}")
+                            pbar.progress(i / total_i)
 
-        overall.progress(idx/total)
+                    if detailed:
+                        saved = await download_product_images_async(session, int(nm_raw), pics, subdir,
+                                                                   detailed=True, progress_cb=progress_cb)
+                    else:
+                        saved = await download_product_images_async(session, int(nm_raw), pics, subdir,
+                                                                   detailed=False, progress_cb=None)
+                        pbar.progress(1.0)
+                        line.write(f"Готово: сохранено {saved} из ~{pics}")
+
+                if saved > 0:
+                    ok_list.append((url, subdir.name, saved))
+                else:
+                    err_list.append((url, "Не удалось сохранить изображения"))
+
+                overall.progress(idx/total)
+
+    # запускаем основной асинхронный процесс
+    asyncio.run(process_all())
 
     # Сводка/Excel/Коллаж
     competitors = sorted([p for p in root.iterdir() if p.is_dir()])
